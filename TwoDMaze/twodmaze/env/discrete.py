@@ -29,7 +29,7 @@ class PursuitEvasionParallelEnv(ParallelEnv):
         self.frames = []  # store frames for animation
         # define safe zone (bottom-left corner)
         self.safe_zone = (self.grid_size - 1, 0)
-        self.terminal_reward = 10000
+        self.terminal_reward = 30
         self.safe_zone_distance_factor = 1
         # obstacles (list of (y,x) tuples)
         if obstacles is None:
@@ -52,7 +52,7 @@ class PursuitEvasionParallelEnv(ParallelEnv):
         if seed is not None:
             np.random.seed(seed)
         # positions: pursuer (top-left), evader (bottom-right)
-        self.pos = {"pursuer": [0, 0], "evader": [self.grid_size - 1, 3]}
+        self.pos = {"pursuer": [0, 3], "evader": [0, 4]}
         self.step_count = 0
         self.frames = []  # reset frame buffer
         obs = self._get_obs()
@@ -264,7 +264,7 @@ if __name__ == "__main__":
     actions = list(range(4))  # up, down, left, right
 
     # --- training loop ---
-    num_episodes = 1500
+    num_episodes = 30000
     init_eps = 0.3
     init_alpha = 0.2
     gamma = 1
@@ -319,8 +319,8 @@ if __name__ == "__main__":
 
             # take a step in the environment
             next_obs, rewards, terminations, truncations, infos = env.step(actions_dict)
-            rewards["pursuer"] /= step + 1
-            rewards["evader"] /= step+1
+            # rewards["pursuer"] /= step + 1
+            # rewards["evader"] /= step+1
             total_rewards["pursuer"] += rewards["pursuer"]
             total_rewards["evader"] += rewards["evader"]
 
