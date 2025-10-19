@@ -89,7 +89,7 @@ class TwoAgentFrozenLake:
         r1 = 1.0 if (y1, x1) != self.goal and (ny1, nx1) == self.goal else 0.0
         r2 = 1.0 if (y2, x2) != self.goal and (ny2, nx2) == self.goal else 0.0
 
-        reward = r1 + r2 - 0.05  # base step penalty
+        reward = r1 + r2 - 0.08  # base step penalty
 
         gy, gx = self.goal
         dist_before = abs(gy - y1) + abs(gx - x1) + abs(gy - y2) + abs(gx - x2)
@@ -718,7 +718,7 @@ def save_qtables(env, agent1, agent2,
 if __name__ == "__main__":
     env, agent1, agent2, rewards, steps, mean_q1, mean_q2, epsilons = \
         train_two_agents_representative(
-            episodes_per_start=6000,  # 8–20 works well on 4x4
+            episodes_per_start=12000,  # 8–20 works well on 4x4
             map_size=4,
             seed=123,
             include_goal_starts=False,  # usually better to exclude
