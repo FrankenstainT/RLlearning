@@ -89,7 +89,7 @@ class TwoAgentFrozenLake:
         r1 = 1.0 if (y1, x1) != self.goal and (ny1, nx1) == self.goal else 0.0
         r2 = 1.0 if (y2, x2) != self.goal and (ny2, nx2) == self.goal else 0.0
 
-        reward = r1 + r2 - 0.01  # base step penalty
+        reward = r1 + r2 - 0.02  # base step penalty
 
         gy, gx = self.goal
         dist_before = abs(gy - y1) + abs(gx - x1) + abs(gy - y2) + abs(gx - x2)
@@ -134,7 +134,7 @@ class TwoAgentFrozenLake:
         # normal step (same shaping as step())
         r1 = 1.0 if (y1, x1) != self.goal and (ny1, nx1) == self.goal else 0.0
         r2 = 1.0 if (y2, x2) != self.goal and (ny2, nx2) == self.goal else 0.0
-        reward = r1 + r2 - 0.01
+        reward = r1 + r2 - 0.02
 
         gy, gx = self.goal
         dist_before = abs(gy - y1) + abs(gx - x1) + abs(gy - y2) + abs(gx - x2)
@@ -241,12 +241,13 @@ def train_two_agents_representative(
 
     # Build representative start list: all safe x safe (overlap allowed)
     safe = env.safe_indices(include_goal=include_goal_starts)
-    #start_pairs = [(s1, s2) for s1 in safe for s2 in safe]
-    start_pairs = [(0,0) for _ in range(10)]
+    # start_pairs = [(s1, s2) for s1 in safe for s2 in safe]
+    start_pairs = [(0, 0) for _ in range(10)]
     rng.shuffle(start_pairs)
     total_episodes = len(start_pairs) * episodes_per_start
     ep_counter = 0
     rewards, steps, mean_q1, mean_q2 = [], [], [], []
+    epsilons = []  # <--- add this
     agent1.epsilon = eps_start
     agent2.epsilon = eps_start
     for (s1_idx, s2_idx) in tqdm(start_pairs, desc="Start pairs"):
@@ -291,14 +292,15 @@ def train_two_agents_representative(
             steps.append(t)
             mean_q1.append(np.mean(agent1.qtable));
             mean_q2.append(np.mean(agent2.qtable))
+            epsilons.append(agent1.epsilon)
 
-    return env, agent1, agent2, rewards, steps, mean_q1, mean_q2
+    return env, agent1, agent2, rewards, steps, mean_q1, mean_q2, episilons
 
 
 # ============================================================
 #                       VISUALIZATION
 # ============================================================
-def plot_training_statistics(rewards, steps, mean_q1, mean_q2):
+def plot_training_statistics(rewards, steps, mean_q1, mean_q2, epsilons):
     def smooth(x, k=100):
         return np.convolve(x, np.ones(k) / k, mode="valid")
 
@@ -318,9 +320,9 @@ def plot_training_statistics(rewards, steps, mean_q1, mean_q2):
     ax[2].set_title("Mean Q-values")
     ax[2].set_ylabel("Q")
 
-    # ax[3].plot(epsilons)
-    # ax[3].set_title("Epsilon Decay (Exploration Rate)")
-    # ax[3].set_ylabel("Epsilon")
+    ax[3].plot(epsilons)
+    ax[3].set_title("Epsilon Decay (Exploration Rate)")
+    ax[3].set_ylabel("Epsilon")
 
     plt.xlabel("Episode")
     plt.tight_layout()
@@ -675,6 +677,8 @@ def plot_agent_best_maps_combined(agent1, agent2, env):
     plt.savefig("results/agent_best_per_cell_combined.png", bbox_inches="tight", dpi=200)
     plt.show()
     plt.close(fig)
+
+
 # --- NEW: saving utility ------------------------------------------------------
 def save_qtables(env, agent1, agent2,
                  out_npz="results/qtables_final.npz",
@@ -712,19 +716,19 @@ def save_qtables(env, agent1, agent2,
 #                           RUN
 # ============================================================
 if __name__ == "__main__":
-    env, agent1, agent2, rewards, steps, mean_q1, mean_q2 = \
+    env, agent1, agent2, rewards, steps, mean_q1, mean_q2, epsilons = \
         train_two_agents_representative(
             episodes_per_start=3000,  # 8–20 works well on 4x4
             map_size=4,
             seed=123,
             include_goal_starts=False,  # usually better to exclude
             max_steps=100,
-            eps_start=0.2, eps_end=0.02
+            eps_start=0.4, eps_end=0.02
         )
     # <-- save the final Q-tables
     save_qtables(env, agent1, agent2)
     # 1) normal plots
-    plot_training_statistics(rewards, steps, mean_q1, mean_q2)
+    plot_training_statistics(rewards, steps, mean_q1, mean_q2, epsilons)
     plot_frozenlake_map(env)
     plot_joint_policy(agent1, agent2, env)
 
