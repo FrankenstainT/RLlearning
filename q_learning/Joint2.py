@@ -37,6 +37,7 @@ class TwoAgentFrozenLake:
         self.n_actions = 4
         self.goal = (self.n - 1, self.n - 1)
         self.current_state = None
+        self.step_penalty = -0.08
 
     # ----- Coordinate helpers -----
     def encode_state(self, s1, s2):
@@ -82,24 +83,29 @@ class TwoAgentFrozenLake:
         else:
             ny2, nx2 = self.move(y2, x2, a2)
         tile1, tile2 = self.desc[ny1, nx1], self.desc[ny2, nx2]
+        r1 = 0
+        r2 = 0
         if tile1 == "H" or tile2 == "H":
             self.current_state = ((ny1, nx1), (ny2, nx2))
             ns = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
-            return ns, -1.0, True
+            if tile1 == "H":
+                r1 = -1
+            if tile2 == 'H':
+                r2 = -1
+            return ns, r1, r2, True
         r1 = 1.0 if (y1, x1) != self.goal and (ny1, nx1) == self.goal else 0.0
         r2 = 1.0 if (y2, x2) != self.goal and (ny2, nx2) == self.goal else 0.0
 
-        reward = r1 + r2 - 0.08  # base step penalty
-
+        r1 += self.step_penalty  # base step penalty
+        r2 += self.step_penalty
         gy, gx = self.goal
-        dist_before = abs(gy - y1) + abs(gx - x1) + abs(gy - y2) + abs(gx - x2)
-        dist_after = abs(gy - ny1) + abs(gx - nx1) + abs(gy - ny2) + abs(gx - nx2)
-        reward += 0.1 * (dist_before - dist_after)
+        r1 += 0.1 * (abs(gy - y1) + abs(gx - x1)-(abs(gy - ny1) + abs(gx - nx1)))
+        r2 += .1 * (abs(gy - y2) + abs(gx - x2)-(abs(gy - ny2) + abs(gx - nx2)))
         done = (tile1 == "G" and tile2 == "G")
 
         self.current_state = ((ny1, nx1), (ny2, nx2))
         next_state = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
-        return next_state, reward, done
+        return next_state, r1, r2, done
 
     def step_with_info(self, a1, a2):
         (y1, x1), (y2, x2) = self.current_state
@@ -134,13 +140,15 @@ class TwoAgentFrozenLake:
         # normal step (same shaping as step())
         r1 = 1.0 if (y1, x1) != self.goal and (ny1, nx1) == self.goal else 0.0
         r2 = 1.0 if (y2, x2) != self.goal and (ny2, nx2) == self.goal else 0.0
-        reward = r1 + r2 - 0.02
+        r1+= self.step_penalty
+        r2+= self.step_penalty
 
         gy, gx = self.goal
         dist_before = abs(gy - y1) + abs(gx - x1) + abs(gy - y2) + abs(gx - x2)
         dist_after = abs(gy - ny1) + abs(gx - nx1) + abs(gy - ny2) + abs(gx - nx2)
-        proximity_gain = 0.02 * (dist_before - dist_after)
-        reward += proximity_gain
+        proximity_gain = 0.1 * (dist_before - dist_after)
+        r1 += .1*(abs(gy - y1) + abs(gx - x1)-(abs(gy - ny1) + abs(gx - nx1)))
+        r2+= .1*(abs(gy - y2) + abs(gx - x2)-(abs(gy - ny2) + abs(gx - nx2)))
 
         done = (tile1 == "G" and tile2 == "G")
 
@@ -154,15 +162,16 @@ class TwoAgentFrozenLake:
             "ns1_yx": (ny1, nx1), "ns2_yx": (ny2, nx2),
             "a1": a1, "a2": a2,
             "r_env_1": r1, "r_env_2": r2,
-            "base_step_penalty": -0.01,
+            "base_step_penalty": - 0.08,
             "proximity_gain": proximity_gain,
             "hole_penalty": 0.0,
             "dist_before": dist_before, "dist_after": dist_after,
-            "total_reward": reward,
+            "reward_r1": r1,
+            "reward_r2": r2,
             "done": done,
             "tile1": tile1, "tile2": tile2,
         }
-        return next_state, reward, done, info
+        return next_state, r1,r2, done, info
 
     def render(self):
         grid = self.desc.copy().astype(str)
@@ -271,16 +280,16 @@ def train_two_agents_representative(
                 # Choose actions (frozen agents take a no-op placeholder)
                 a1 = 1 if at_goal1 else agent1.choose_action(state)
                 a2 = 1 if at_goal2 else agent2.choose_action(state)
-                ns, r, done = env.step(a1, a2)
+                ns, r1, r2, done = env.step(a1, a2)
 
                 # Update only agents that are not already waiting on the goal
                 if not at_goal1:
-                    agent1.update(state, a1, r, ns)
+                    agent1.update(state, a1, r1, ns)
                 if not at_goal2:
-                    agent2.update(state, a2, r, ns)
+                    agent2.update(state, a2, r2, ns)
 
                 state = ns
-                total_r += r
+                total_r += r1+r2
                 t += 1
 
             # per-episode epsilon decay within the same start
@@ -460,9 +469,13 @@ def debug_episode(env, agent1, agent2, max_steps=200, greedy=True,
         agent2.epsilon = 0.0
 
     for t in range(1, max_steps + 1):
-        # pick actions
-        a1 = np.argmax(agent1.qtable[state, :]) if greedy else agent1.choose_action(state)
-        a2 = np.argmax(agent2.qtable[state, :]) if greedy else agent2.choose_action(state)
+        # Is an agent already parked on the goal at the *current* state?
+        s1_idx_curr, s2_idx_curr = env.decode_state(state)
+        at_goal1 = env.idx_to_pos(s1_idx_curr) == env.goal
+        at_goal2 = env.idx_to_pos(s2_idx_curr) == env.goal
+        # Choose actions (frozen agents take a no-op placeholder)
+        a1 = 1 if at_goal1 else (np.argmax(agent1.qtable[state, :]) if greedy else agent1.choose_action(state))
+        a2 = 1 if at_goal2 else (np.argmax(agent2.qtable[state, :]) if greedy else agent2.choose_action(state))
 
         # step with info
         ns, reward, done, info = env.step_with_info(a1, a2)
@@ -723,18 +736,20 @@ if __name__ == "__main__":
             max_steps=30,
             eps_start=0.4, eps_end=0.02
         )
+
     # <-- save the final Q-tables
     save_qtables(env, agent1, agent2)
+    df_debug = debug_episode(env, agent1, agent2,
+                             max_steps=100, greedy=True,
+                             csv_path="results/debug_episode_log.csv",
+                             save_csv=True, verbose_first_n=12)
     # 1) normal plots
     plot_training_statistics(rewards, steps, mean_q1, mean_q2, epsilons)
     plot_frozenlake_map(env)
     plot_joint_policy(agent1, agent2, env)
 
     # 2) step-by-step debug of ONE episode (greedy to read the learned policy directly)
-    # df_debug = debug_episode(env, agent1, agent2,
-    #                          max_steps=100, greedy=True,
-    #                          csv_path="results/debug_episode_log.csv",
-    #                          save_csv=True, verbose_first_n=12)
+
 
     # 3) optional: visualize the evolving Q-row of the updated state
     # plot_qrow_timeseries(df_debug, which_agent=1, save_path="results/debug_qrow_timeseries_agent1.png")
