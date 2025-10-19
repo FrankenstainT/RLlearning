@@ -94,7 +94,7 @@ class TwoAgentFrozenLake:
         gy, gx = self.goal
         dist_before = abs(gy - y1) + abs(gx - x1) + abs(gy - y2) + abs(gx - x2)
         dist_after = abs(gy - ny1) + abs(gx - nx1) + abs(gy - ny2) + abs(gx - nx2)
-        reward += 0.02 * (dist_before - dist_after)
+        reward += 0.1 * (dist_before - dist_after)
         done = (tile1 == "G" and tile2 == "G")
 
         self.current_state = ((ny1, nx1), (ny2, nx2))
@@ -176,7 +176,7 @@ class TwoAgentFrozenLake:
 
     # --- add inside class TwoAgentFrozenLake ---
 
-    def safe_indices(self, include_goal=False):
+    def safe_indices(self):
         """All non-hole tiles as scalar indices."""
         safe = []
         for r in range(self.n):
@@ -184,7 +184,7 @@ class TwoAgentFrozenLake:
                 t = self.desc[r, c]
                 if t == "H":
                     continue
-                if not include_goal and t == "G":
+                if t == "G":
                     continue
                 safe.append(self.pos_to_idx((r, c)))
         return safe
@@ -224,10 +224,9 @@ def train_two_agents_representative(
         episodes_per_start=100,
         map_size=4,
         seed=123,
-        include_goal_starts=False,
-        max_steps=200,
+        max_steps=30,
         eps_start=0.4,
-        eps_end=0.05,
+        eps_end=0.02,
         alpha_start=0.8,
         alpha_end=0.2,
 ):
@@ -240,10 +239,10 @@ def train_two_agents_representative(
     agent2 = IndependentAgent(state_size, action_size, seed=seed + 1)
 
     # Build representative start list: all safe x safe (overlap allowed)
-    safe = env.safe_indices(include_goal=include_goal_starts)
+    safe = env.safe_indices()
     # start_pairs = [(s1, s2) for s1 in safe for s2 in safe]
     start_pairs = [(0, 0) for _ in range(10)]
-    rng.shuffle(start_pairs)
+    #rng.shuffle(start_pairs)
     total_episodes = len(start_pairs) * episodes_per_start
     ep_counter = 0
     rewards, steps, mean_q1, mean_q2 = [], [], [], []
@@ -721,8 +720,7 @@ if __name__ == "__main__":
             episodes_per_start=12000,  # 8–20 works well on 4x4
             map_size=4,
             seed=123,
-            include_goal_starts=False,  # usually better to exclude
-            max_steps=100,
+            max_steps=30,
             eps_start=0.4, eps_end=0.02
         )
     # <-- save the final Q-tables
