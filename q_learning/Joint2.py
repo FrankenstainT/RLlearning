@@ -102,59 +102,52 @@ class TwoAgentFrozenLake:
         return next_state, reward, done
 
     def step_with_info(self, a1, a2):
-        """
-        Same transition as step(), but also returns a detailed reward/Q-debug info dict.
-        This recomputes the same reward shaping deterministically to expose components.
-        """
         (y1, x1), (y2, x2) = self.current_state
 
-        # --- next positions (same as in step) ---
-        ny1, nx1 = self.move(y1, x1, a1)
-        ny2, nx2 = self.move(y2, x2, a2)
+        # respect waiting at goal (same as step)
+        ny1, nx1 = (y1, x1) if (y1, x1) == self.goal else self.move(y1, x1, a1)
+        ny2, nx2 = (y2, x2) if (y2, x2) == self.goal else self.move(y2, x2, a2)
 
         tile1, tile2 = self.desc[ny1, nx1], self.desc[ny2, nx2]
-        r1 = 1.0 if tile1 == "G" else 0.0
-        r2 = 1.0 if tile2 == "G" else 0.0
-        base_step_penalty = -0.01
+
+        # hole is terminal, reward = -1.0  (match step)
+        if tile1 == "H" or tile2 == "H":
+            self.current_state = ((ny1, nx1), (ny2, nx2))
+            next_state = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
+            info = {...}  # keep your fields, set totals to -1.0 and done=True
+            info.update(total_reward=-1.0, hole_penalty=-1.0, done=True)
+            return next_state, -1.0, True, info
+
+        r1 = 1.0 if (y1, x1) != self.goal and (ny1, nx1) == self.goal else 0.0
+        r2 = 1.0 if (y2, x2) != self.goal and (ny2, nx2) == self.goal else 0.0
+        reward = r1 + r2 - 0.01
 
         gy, gx = self.goal
         dist_before = abs(gy - y1) + abs(gx - x1) + abs(gy - y2) + abs(gx - x2)
         dist_after = abs(gy - ny1) + abs(gx - nx1) + abs(gy - ny2) + abs(gx - nx2)
-        proximity_coef = 0.02
-        proximity_gain = proximity_coef * (dist_before - dist_after)
+        proximity_gain = 0.02 * (dist_before - dist_after)
+        reward += proximity_gain
 
-        hole_penalty = 0.0
-        if tile1 == "H" or tile2 == "H":
-            hole_penalty = -0.5
-
-        total_reward = (r1 + r2) + base_step_penalty + proximity_gain + hole_penalty
-
-        # Commit the state change (match step)
-        self.current_state = ((ny1, nx1), (ny2, nx2))
         done = (tile1 == "G" and tile2 == "G")
+        self.current_state = ((ny1, nx1), (ny2, nx2))
         next_state = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
 
         info = {
-            # raw indices & coords
-            "s1": self.pos_to_idx((y1, x1)),
-            "s2": self.pos_to_idx((y2, x2)),
-            "ns1": self.pos_to_idx((ny1, nx1)),
-            "ns2": self.pos_to_idx((ny2, nx2)),
+            "s1": self.pos_to_idx((y1, x1)), "s2": self.pos_to_idx((y2, x2)),
+            "ns1": self.pos_to_idx((ny1, nx1)), "ns2": self.pos_to_idx((ny2, nx2)),
             "s1_yx": (y1, x1), "s2_yx": (y2, x2),
             "ns1_yx": (ny1, nx1), "ns2_yx": (ny2, nx2),
             "a1": a1, "a2": a2,
-            # reward components
             "r_env_1": r1, "r_env_2": r2,
-            "base_step_penalty": base_step_penalty,
+            "base_step_penalty": -0.01,
             "proximity_gain": proximity_gain,
-            "hole_penalty": hole_penalty,
+            "hole_penalty": 0.0,
             "dist_before": dist_before, "dist_after": dist_after,
-            "total_reward": total_reward,
+            "total_reward": reward,
             "done": done,
-            # tiles
             "tile1": tile1, "tile2": tile2,
         }
-        return next_state, total_reward, done, info
+        return next_state, reward, done, info
 
     def render(self):
         grid = self.desc.copy().astype(str)
@@ -220,8 +213,8 @@ def train_two_agents_representative(
         max_steps=200,
         eps_start=0.4,
         eps_end=0.05,
-        alpha_start = 0.8,
-        alpha_end = 0.2,
+        alpha_start=0.8,
+        alpha_end=0.2,
 ):
     env = TwoAgentFrozenLake(map_size=map_size, seed=seed)
     rng = np.random.default_rng(seed)
@@ -233,7 +226,8 @@ def train_two_agents_representative(
 
     # Build representative start list: all safe x safe (overlap allowed)
     safe = env.safe_indices(include_goal=include_goal_starts)
-    start_pairs = [(s1, s2) for s1 in safe for s2 in safe]
+    #start_pairs = [(s1, s2) for s1 in safe for s2 in safe]
+    start_pairs = [(0,0) for _ in range(30)]
     rng.shuffle(start_pairs)
     total_episodes = len(start_pairs) * episodes_per_start
     ep_counter = 0
@@ -243,7 +237,7 @@ def train_two_agents_representative(
         # anneal epsilon within this mini-batch
         agent1.epsilon = eps_start
         agent2.epsilon = eps_start
-        #eps_decay = .99  # (eps_end / eps_start) ** (1.0 / max(1, episodes_per_start - 1))
+        # eps_decay = .99  # (eps_end / eps_start) ** (1.0 / max(1, episodes_per_start - 1))
 
         for _ in range(episodes_per_start):
             # GLIE-style schedules (global, not reset per start)
@@ -323,26 +317,35 @@ def plot_training_statistics(rewards, steps, mean_q1, mean_q2):
 
 
 def plot_frozenlake_map(env):
-    """Draw map with start, frozen, holes, goal."""
+    """Draw map with start, frozen, holes, goal.
+    Coordinate system: (0,0) top-left, (n-1,0) bottom-left.
+    """
     desc = env.desc
     n = desc.shape[0]
-    color_map = {
-        "S": "#90ee90", "F": "#add8e6", "H": "#d3d3d3", "G": "#ffd700"
-    }
+    color_map = {"S": "#90ee90", "F": "#add8e6", "H": "#d3d3d3", "G": "#ffd700"}
 
     fig, ax = plt.subplots(figsize=(5, 5))
     ax.set_title("FrozenLake Map Layout")
+
+    # draw each tile at (col=j, row=i) without vertical flip
     for i in range(n):
         for j in range(n):
             tile = desc[i, j]
-            ax.add_patch(plt.Rectangle((j, n - i - 1), 1, 1,
-                                       color=color_map.get(tile, "white"), ec="black"))
-            ax.text(j + 0.5, n - i - 0.5, tile, ha="center", va="center", fontsize=14, weight="bold")
+            ax.add_patch(
+                plt.Rectangle((j, i), 1, 1,
+                              color=color_map.get(tile, "white"),
+                              ec="black", lw=0.7)
+            )
+            ax.text(j + 0.5, i + 0.5, tile,
+                    ha="center", va="center", fontsize=14, weight="bold")
+
     ax.set_xlim(0, n)
-    ax.set_ylim(0, n)
+    ax.set_ylim(n, 0)  # invert Y so row 0 is at the top
     ax.set_xticks(range(n + 1))
     ax.set_yticks(range(n + 1))
     ax.grid(True, color="black", linewidth=0.7)
+    ax.set_aspect("equal")
+
     plt.tight_layout()
     plt.savefig("results/frozenlake_map_custom.png", bbox_inches="tight")
     plt.show()
@@ -369,8 +372,10 @@ def plot_joint_policy(agent1, agent2, env):
 
     # Quiver fields
     Y, X = np.mgrid[0:nS, 0:nS]
-    U1 = np.zeros_like(X, dtype=float); V1 = np.zeros_like(Y, dtype=float)
-    U2 = np.zeros_like(X, dtype=float); V2 = np.zeros_like(Y, dtype=float)
+    U1 = np.zeros_like(X, dtype=float);
+    V1 = np.zeros_like(Y, dtype=float)
+    U2 = np.zeros_like(X, dtype=float);
+    V2 = np.zeros_like(Y, dtype=float)
 
     for s1 in range(nS):
         for s2 in range(nS):
@@ -390,7 +395,8 @@ def plot_joint_policy(agent1, agent2, env):
     ax.grid(True, linestyle="--", linewidth=0.4)
 
     # Offsets so arrows don’t overlap
-    off1x, off1y = AGENT_OFFSETS[1]; off2x, off2y = AGENT_OFFSETS[2]
+    off1x, off1y = AGENT_OFFSETS[1];
+    off2x, off2y = AGENT_OFFSETS[2]
 
     # --- PLOT ONLY WHERE MASK == True ---
     ax.quiver(X[M] + off1x, Y[M] + off1y, U1[M], V1[M],
@@ -402,8 +408,8 @@ def plot_joint_policy(agent1, agent2, env):
     ticks = np.arange(nS)
     ax.set_xticks(ticks)
     ax.set_yticks(ticks)
-    ax.set_xticklabels([str(env.idx_to_pos(i)) for i in ticks], rotation=90, fontsize=8)
-    ax.set_yticklabels([str(env.idx_to_pos(i)) for i in ticks], fontsize=8)
+    ax.set_xticklabels([str(tuple(map(int, env.idx_to_pos(i)))) for i in ticks], rotation=90, fontsize=8)
+    ax.set_yticklabels([str(tuple(map(int, env.idx_to_pos(i)))) for i in ticks], fontsize=8)
 
     # goal guides (just lines, no arrows on those rows/cols because mask blocks them)
     g_idx = env.pos_to_idx(env.goal)
@@ -413,8 +419,8 @@ def plot_joint_policy(agent1, agent2, env):
 
     plt.tight_layout()
     plt.savefig("results/joint_policy_map_quiver.png", bbox_inches="tight", dpi=200)
-    plt.show(); plt.close(fig)
-
+    plt.show();
+    plt.close(fig)
 
 
 ACTION_NAMES = {0: "LEFT", 1: "DOWN", 2: "RIGHT", 3: "UP"}
@@ -585,50 +591,48 @@ def best_action_per_cell(agent, env, who=1):
     return best_act, best_val
 
 
-
 def plot_agent_best_maps_combined(agent1, agent2, env):
     """
     One physical map. For each cell, draw both agents’ best actions
-    (max over the other agent’s position). Arrows are offset so they don’t overlap.
-    No arrows on holes or the goal. Uses flipped Y to match background tiles.
+    (max over the other agent’s SAFE positions). Arrows are offset so
+    they don’t overlap. No arrows on holes or the goal.
+    Coordinate system: (0,0) top-left, (n-1,0) bottom-left.
     """
     n = env.n
     desc = env.desc
     color_map = {"S": "#90ee90", "F": "#add8e6", "H": "#d3d3d3", "G": "#ffd700"}
 
-    # Best action per physical cell for each agent
+    # Best action per physical cell for each agent (already excludes H/G in the calc)
     agrid1, _ = best_action_per_cell(agent1, env, who=1)
     agrid2, _ = best_action_per_cell(agent2, env, who=2)
 
     fig, ax = plt.subplots(figsize=(6.5, 6.5))
     ax.set_title("Best Option per Cell (A1=Black, A2=Orange)\n(no arrows on holes or goal)")
 
-    # --- draw map (note the vertical flip: y = n - i - 1) ---
+    # --- draw map with (row, col) natural placement ---
     for i in range(n):
         for j in range(n):
             tile = desc[i, j]
             ax.add_patch(
-                plt.Rectangle((j, n - i - 1), 1, 1,
-                              color=color_map.get(tile, "white"), ec="black", lw=0.7)
+                plt.Rectangle((j, i), 1, 1, color=color_map.get(tile, "white"), ec="black", lw=0.7)
             )
-            ax.text(j + 0.5, n - i - 0.5, tile, ha="center", va="center",
+            ax.text(j + 0.5, i + 0.5, tile, ha="center", va="center",
                     fontsize=12, weight="bold", color="black")
 
-    ax.set_xlim(0, n);
-    ax.set_ylim(0, n)
-    ax.set_xticks(range(n + 1));
+    ax.set_xlim(0, n)
+    ax.set_ylim(n, 0)  # <-- invert Y: (0,0) is top-left; (n-1,0) bottom-left
+    ax.set_xticks(range(n + 1))
     ax.set_yticks(range(n + 1))
     ax.grid(True, color="black", linewidth=0.4)
     ax.set_aspect('equal')
 
-    # ---- centers in *plot* coordinates (flip Y to match tiles) ----
-    Xc_grid, Yc_grid = np.meshgrid(np.arange(n) + 0.5, np.arange(n) + 0.5)  # array coords
-    Xc = Xc_grid
-    Yc = n - Yc_grid  # <-- flip so row 0 appears at bottom
+    # centers in plot coordinates (no flip now)
+    Xc_grid, Yc_grid = np.meshgrid(np.arange(n) + 0.5, np.arange(n) + 0.5)
+    Xc, Yc = Xc_grid, Yc_grid
 
     def draw_for_agent(agrid, agent_id):
         offx, offy = AGENT_OFFSETS[agent_id]
-        U = np.zeros_like(Xc, dtype=float);
+        U = np.zeros_like(Xc, dtype=float)
         V = np.zeros_like(Yc, dtype=float)
         M = np.zeros_like(Xc, dtype=bool)
 
@@ -639,26 +643,24 @@ def plot_agent_best_maps_combined(agent1, agent2, env):
                     M[i, j] = False
                     continue
                 dy, dx = ACTION_VEC[int(agrid[i, j])]
-                # convert grid motion (row+,col+) to plot coords (x right, y up)
+                # with inverted Y-axis, positive dy goes down as desired
                 U[i, j] = dx
-                V[i, j] = -dy
+                V[i, j] = dy
                 M[i, j] = True
 
         ax.quiver(Xc[M] + offx, Yc[M] + offy, U[M], V[M],
                   color=AGENT_COLORS[agent_id], alpha=0.95, **ARROW_STYLE)
 
-    # draw both agents on the same map
     draw_for_agent(agrid1, 1)
     draw_for_agent(agrid2, 2)
 
-    # legend
     ax.plot([], [], color=AGENT_COLORS[1], label="Agent 1")
     ax.plot([], [], color=AGENT_COLORS[2], label="Agent 2")
     ax.legend(loc="upper left")
 
     plt.tight_layout()
     plt.savefig("results/agent_best_per_cell_combined.png", bbox_inches="tight", dpi=200)
-    plt.show();
+    plt.show()
     plt.close(fig)
 
 
