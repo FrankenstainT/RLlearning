@@ -1,0 +1,644 @@
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import os
+
+os.makedirs("results", exist_ok=True)
+sns.set_theme()
+ACTION_VEC = {0: (0, -1), 1: (1, 0), 2: (0, 1), 3: (-1, 0)}  # (dy, dx) in grid (row, col)
+ARROW_STYLE = dict(angles='xy', scale_units='xy', scale=3, width=0.006)
+
+AGENT_COLORS = {1: "black", 2: "darkorange"}
+AGENT_OFFSETS = {1: (-0.15, -0.15), 2: (0.15, 0.15)}  # (dx, dy) visual offset so arrows won’t overlap
+
+
+# ============================================================
+#                CUSTOM TWO-AGENT FROZEN LAKE ENV
+# ============================================================
+class TwoAgentFrozenLake:
+    """
+    Custom two-agent FrozenLake environment.
+    Both agents move on a shared 4x4 grid with holes, frozen tiles, and one goal.
+    The episode ends when both reach the goal.
+    """
+
+    def __init__(self, map_size=4, seed=123):
+        self.n = map_size
+        self.rng = np.random.default_rng(seed)
+        self.desc = np.array([
+            list("SFFF"),
+            list("FHFH"),
+            list("FFFH"),
+            list("HFFG"),
+        ])
+        self.n_states = self.n * self.n
+        self.n_actions = 4
+        self.goal = (self.n - 1, self.n - 1)
+        self.current_state = None
+
+    # ----- Coordinate helpers -----
+    def encode_state(self, s1, s2):
+        return s1 * self.n_states + s2
+
+    def decode_state(self, joint_idx):
+        return divmod(joint_idx, self.n_states)
+
+    def move(self, y, x, action):
+        """Move one agent according to the action, bounded by edges."""
+        if action == 0:  # LEFT
+            x = max(x - 1, 0)
+        elif action == 1:  # DOWN
+            y = min(y + 1, self.n - 1)
+        elif action == 2:  # RIGHT
+            x = min(x + 1, self.n - 1)
+        elif action == 3:  # UP
+            y = max(y - 1, 0)
+        return y, x
+
+    # ----- Environment core -----
+    def reset(self):
+        s1 = (0, 0)
+        s2 = (0, 0)
+        self.current_state = (s1, s2)
+        return self.encode_state(self.pos_to_idx(s1), self.pos_to_idx(s2))
+
+    def pos_to_idx(self, pos):
+        y, x = pos
+        return y * self.n + x
+
+    def idx_to_pos(self, idx):
+        return divmod(idx, self.n)
+
+    def step(self, a1, a2):
+        (y1, x1), (y2, x2) = self.current_state
+        (y1, x1), (y2, x2) = self.current_state
+        if (y1, x1) == self.goal:
+            ny1, nx1 = y1, x1
+        else:
+            ny1, nx1 = self.move(y1, x1, a1)
+        if (y2, x2) == self.goal:
+            ny2, nx2 = y2, x2
+        else:
+            ny2, nx2 = self.move(y2, x2, a2)
+        tile1, tile2 = self.desc[ny1, nx1], self.desc[ny2, nx2]
+
+        r1 = 1.0 if tile1 == "G" else 0.0
+        r2 = 1.0 if tile2 == "G" else 0.0
+        reward = r1 + r2 - 0.01  # base step penalty
+
+        gy, gx = self.goal
+        dist_before = abs(gy - y1) + abs(gx - x1) + abs(gy - y2) + abs(gx - x2)
+        dist_after = abs(gy - ny1) + abs(gx - nx1) + abs(gy - ny2) + abs(gx - nx2)
+        reward += 0.02 * (dist_before - dist_after)
+
+        if tile1 == "H" or tile2 == "H":
+            reward -= 0.5  # hole penalty
+
+        done = (tile1 == "G" and tile2 == "G")
+        self.current_state = ((ny1, nx1), (ny2, nx2))
+        next_state = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
+        return next_state, reward, done
+
+    def step_with_info(self, a1, a2):
+        """
+        Same transition as step(), but also returns a detailed reward/Q-debug info dict.
+        This recomputes the same reward shaping deterministically to expose components.
+        """
+        (y1, x1), (y2, x2) = self.current_state
+
+        # --- next positions (same as in step) ---
+        ny1, nx1 = self.move(y1, x1, a1)
+        ny2, nx2 = self.move(y2, x2, a2)
+
+        tile1, tile2 = self.desc[ny1, nx1], self.desc[ny2, nx2]
+        r1 = 1.0 if tile1 == "G" else 0.0
+        r2 = 1.0 if tile2 == "G" else 0.0
+        base_step_penalty = -0.01
+
+        gy, gx = self.goal
+        dist_before = abs(gy - y1) + abs(gx - x1) + abs(gy - y2) + abs(gx - x2)
+        dist_after = abs(gy - ny1) + abs(gx - nx1) + abs(gy - ny2) + abs(gx - nx2)
+        proximity_coef = 0.02
+        proximity_gain = proximity_coef * (dist_before - dist_after)
+
+        hole_penalty = 0.0
+        if tile1 == "H" or tile2 == "H":
+            hole_penalty = -0.5
+
+        total_reward = (r1 + r2) + base_step_penalty + proximity_gain + hole_penalty
+
+        # Commit the state change (match step)
+        self.current_state = ((ny1, nx1), (ny2, nx2))
+        done = (tile1 == "G" and tile2 == "G")
+        next_state = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
+
+        info = {
+            # raw indices & coords
+            "s1": self.pos_to_idx((y1, x1)),
+            "s2": self.pos_to_idx((y2, x2)),
+            "ns1": self.pos_to_idx((ny1, nx1)),
+            "ns2": self.pos_to_idx((ny2, nx2)),
+            "s1_yx": (y1, x1), "s2_yx": (y2, x2),
+            "ns1_yx": (ny1, nx1), "ns2_yx": (ny2, nx2),
+            "a1": a1, "a2": a2,
+            # reward components
+            "r_env_1": r1, "r_env_2": r2,
+            "base_step_penalty": base_step_penalty,
+            "proximity_gain": proximity_gain,
+            "hole_penalty": hole_penalty,
+            "dist_before": dist_before, "dist_after": dist_after,
+            "total_reward": total_reward,
+            "done": done,
+            # tiles
+            "tile1": tile1, "tile2": tile2,
+        }
+        return next_state, total_reward, done, info
+
+    def render(self):
+        grid = self.desc.copy().astype(str)
+        (y1, x1), (y2, x2) = self.current_state
+        if (y1, x1) == (y2, x2):
+            grid[y1, x1] = "B"
+        else:
+            grid[y1, x1] = "1"
+            grid[y2, x2] = "2"
+        print("\n".join("".join(row) for row in grid))
+
+    # --- add inside class TwoAgentFrozenLake ---
+
+    def safe_indices(self, include_goal=False):
+        """All non-hole tiles as scalar indices."""
+        safe = []
+        for r in range(self.n):
+            for c in range(self.n):
+                t = self.desc[r, c]
+                if t == "H":
+                    continue
+                if not include_goal and t == "G":
+                    continue
+                safe.append(self.pos_to_idx((r, c)))
+        return safe
+
+    def reset_to_indices(self, s1_idx, s2_idx):
+        """Reset positions to given scalar indices (can overlap)."""
+        self.current_state = (self.idx_to_pos(s1_idx), self.idx_to_pos(s2_idx))
+        return self.encode_state(s1_idx, s2_idx)
+
+
+# ============================================================
+#                        AGENT
+# ============================================================
+class IndependentAgent:
+    def __init__(self, state_size, action_size, lr=0.8, gamma=0.95, epsilon=1.0, seed=123):
+        self.qtable = np.zeros((state_size, action_size))
+        self.lr = lr
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.rng = np.random.default_rng(seed)
+
+    def choose_action(self, state):
+        if self.rng.uniform(0, 1) < self.epsilon:
+            return self.rng.integers(0, self.qtable.shape[1])
+        max_ids = np.where(self.qtable[state, :] == np.max(self.qtable[state, :]))[0]
+        return self.rng.choice(max_ids)
+
+    def update(self, s, a, r, ns):
+        best_next = np.max(self.qtable[ns, :])
+        self.qtable[s, a] += self.lr * (r + self.gamma * best_next - self.qtable[s, a])
+
+
+# ============================================================
+#                        TRAINING
+# ============================================================
+def train_two_agents_representative(
+        episodes_per_start=100,
+        map_size=4,
+        seed=123,
+        include_goal_starts=False,
+        max_steps=200,
+        eps_start=0.4,
+        eps_end=0.05
+):
+    env = TwoAgentFrozenLake(map_size=map_size, seed=seed)
+    rng = np.random.default_rng(seed)
+
+    state_size = env.n_states ** 2
+    action_size = env.n_actions
+    agent1 = IndependentAgent(state_size, action_size, seed=seed)
+    agent2 = IndependentAgent(state_size, action_size, seed=seed + 1)
+
+    # Build representative start list: all safe x safe (overlap allowed)
+    safe = env.safe_indices(include_goal=include_goal_starts)
+    start_pairs = [(s1, s2) for s1 in safe for s2 in safe]
+    rng.shuffle(start_pairs)
+
+    rewards, steps, mean_q1, mean_q2 = [], [], [], []
+
+    for (s1_idx, s2_idx) in tqdm(start_pairs, desc="Start pairs"):
+        # anneal epsilon within this mini-batch
+        agent1.epsilon = eps_start
+        agent2.epsilon = eps_start
+        eps_decay = .99  # (eps_end / eps_start) ** (1.0 / max(1, episodes_per_start - 1))
+
+        for _ in range(episodes_per_start):
+            state = env.reset_to_indices(s1_idx, s2_idx)
+            done, total_r, t = False, 0.0, 0
+
+            while not done and t < max_steps:
+                a1 = agent1.choose_action(state)
+                a2 = agent2.choose_action(state)
+                ns, r, done = env.step(a1, a2)
+
+                # no bootstrap at terminal (agent.update handles it via 'done')
+                agent1.update(state, a1, r, ns)
+                agent2.update(state, a2, r, ns)
+
+                state = ns
+                total_r += r
+                t += 1
+
+            # per-episode epsilon decay within the same start
+            agent1.epsilon = max(eps_end, agent1.epsilon * eps_decay)
+            agent2.epsilon = max(eps_end, agent2.epsilon * eps_decay)
+
+            rewards.append(total_r);
+            steps.append(t)
+            mean_q1.append(np.mean(agent1.qtable));
+            mean_q2.append(np.mean(agent2.qtable))
+
+    return env, agent1, agent2, rewards, steps, mean_q1, mean_q2
+
+
+# ============================================================
+#                       VISUALIZATION
+# ============================================================
+def plot_training_statistics(rewards, steps, mean_q1, mean_q2, epsilons):
+    def smooth(x, k=100):
+        return np.convolve(x, np.ones(k) / k, mode="valid")
+
+    fig, ax = plt.subplots(4, 1, figsize=(10, 12))
+
+    ax[0].plot(smooth(rewards))
+    ax[0].set_title("Smoothed Total Reward per Episode")
+    ax[0].set_ylabel("Total Reward")
+
+    ax[1].plot(smooth(steps))
+    ax[1].set_title("Smoothed Steps per Episode")
+    ax[1].set_ylabel("Steps")
+
+    ax[2].plot(smooth(mean_q1), label="Agent 1 Mean Q")
+    ax[2].plot(smooth(mean_q2), label="Agent 2 Mean Q", color="darkorange")
+    ax[2].legend()
+    ax[2].set_title("Mean Q-values")
+    ax[2].set_ylabel("Q")
+
+    ax[3].plot(epsilons)
+    ax[3].set_title("Epsilon Decay (Exploration Rate)")
+    ax[3].set_ylabel("Epsilon")
+
+    plt.xlabel("Episode")
+    plt.tight_layout()
+    plt.savefig("results/two_agent_training_stats.png", bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+
+def plot_frozenlake_map(env):
+    """Draw map with start, frozen, holes, goal."""
+    desc = env.desc
+    n = desc.shape[0]
+    color_map = {
+        "S": "#90ee90", "F": "#add8e6", "H": "#d3d3d3", "G": "#ffd700"
+    }
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.set_title("FrozenLake Map Layout")
+    for i in range(n):
+        for j in range(n):
+            tile = desc[i, j]
+            ax.add_patch(plt.Rectangle((j, n - i - 1), 1, 1,
+                                       color=color_map.get(tile, "white"), ec="black"))
+            ax.text(j + 0.5, n - i - 0.5, tile, ha="center", va="center", fontsize=14, weight="bold")
+    ax.set_xlim(0, n)
+    ax.set_ylim(0, n)
+    ax.set_xticks(range(n + 1))
+    ax.set_yticks(range(n + 1))
+    ax.grid(True, color="black", linewidth=0.7)
+    plt.tight_layout()
+    plt.savefig("results/frozenlake_map_custom.png", bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+
+def plot_joint_policy(agent1, agent2, env):
+    nS = env.n_states  # number of scalar positions per agent (n*n)
+
+    # Best action per joint state (row = pos(agent1), col = pos(agent2))
+    q_best1 = np.argmax(agent1.qtable, axis=1).reshape(nS, nS)
+    q_best2 = np.argmax(agent2.qtable, axis=1).reshape(nS, nS)
+
+    Y, X = np.mgrid[0:nS, 0:nS]
+    U1 = np.zeros_like(X, dtype=float);
+    V1 = np.zeros_like(Y, dtype=float)
+    U2 = np.zeros_like(X, dtype=float);
+    V2 = np.zeros_like(Y, dtype=float)
+
+    for s1 in range(nS):
+        for s2 in range(nS):
+            dy1, dx1 = ACTION_VEC[q_best1[s1, s2]]
+            dy2, dx2 = ACTION_VEC[q_best2[s1, s2]]
+            U1[s1, s2], V1[s1, s2] = dx1, dy1
+            U2[s1, s2], V2[s1, s2] = dx2, dy2
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+    ax.set_title("Joint Q-table Policy (Agent1=Black, Agent2=Orange)\nAxes show ALL coordinates (row, col)")
+
+    ax.set_xlim(-0.5, nS - 0.5)
+    ax.set_ylim(nS - 0.5, -0.5)
+    ax.set_xlabel("Agent 2 position (row, col)")
+    ax.set_ylabel("Agent 1 position (row, col)")
+    ax.grid(True, linestyle="--", linewidth=0.4)
+
+    # Offsets so arrows don’t overlap
+    off1x, off1y = AGENT_OFFSETS[1];
+    off2x, off2y = AGENT_OFFSETS[2]
+    ax.quiver(X + off1x, Y + off1y, U1, V1, color=AGENT_COLORS[1], alpha=0.85, **ARROW_STYLE)
+    ax.quiver(X + off2x, Y + off2y, U2, V2, color=AGENT_COLORS[2], alpha=0.85, **ARROW_STYLE)
+
+    # ---- Mark ALL coordinates (0..15) on both axes as (row,col) ----
+    ticks = np.arange(nS)
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
+    ax.set_xticklabels([str(env.idx_to_pos(i)) for i in ticks], rotation=90, fontsize=8)
+    ax.set_yticklabels([str(env.idx_to_pos(i)) for i in ticks], fontsize=8)
+
+    # Show where the goal lies (as cross lines at its scalar index)
+    g_idx = env.pos_to_idx(env.goal)
+    ax.axvline(g_idx, color="green", linestyle="--", linewidth=1)
+    ax.axhline(g_idx, color="green", linestyle="--", linewidth=1)
+    ax.text(g_idx + 0.4, g_idx - 0.6, "Goal", color="green", fontsize=10, weight="bold")
+
+    plt.tight_layout()
+    plt.savefig("results/joint_policy_map_quiver.png", bbox_inches="tight", dpi=200)
+    plt.show();
+    plt.close(fig)
+
+
+ACTION_NAMES = {0: "LEFT", 1: "DOWN", 2: "RIGHT", 3: "UP"}
+
+
+def debug_episode(env, agent1, agent2, max_steps=200, greedy=True,
+                  csv_path="results/debug_episode_log.csv", save_csv=True, verbose_first_n=10):
+    """
+    Run ONE episode and log, step by step:
+      - joint state (and per-agent coords)
+      - chosen actions
+      - reward components (env, step, proximity, hole)
+      - Q-updates for both agents (old, target, td_error, new)
+      - a snapshot of each agent's Q-row at the current state
+    """
+    logs = []
+    state = env.reset()
+
+    # optional greedy evaluation
+    eps1_bak, eps2_bak = agent1.epsilon, agent2.epsilon
+    if greedy:
+        agent1.epsilon = 0.0
+        agent2.epsilon = 0.0
+
+    for t in range(1, max_steps + 1):
+        # pick actions
+        a1 = np.argmax(agent1.qtable[state, :]) if greedy else agent1.choose_action(state)
+        a2 = np.argmax(agent2.qtable[state, :]) if greedy else agent2.choose_action(state)
+
+        # step with info
+        ns, reward, done, info = env.step_with_info(a1, a2)
+
+        # ----- compute & apply Q-updates (same as your learner) -----
+        # Agent 1
+        old_q1 = agent1.qtable[state, a1]
+        best_next_1 = np.max(agent1.qtable[ns, :])
+        target_1 = reward + agent1.gamma * best_next_1
+        td_err_1 = target_1 - old_q1
+        new_q1 = old_q1 + agent1.lr * td_err_1
+        agent1.qtable[state, a1] = new_q1
+
+        # Agent 2
+        old_q2 = agent2.qtable[state, a2]
+        best_next_2 = np.max(agent2.qtable[ns, :])
+        target_2 = reward + agent2.gamma * best_next_2
+        td_err_2 = target_2 - old_q2
+        new_q2 = old_q2 + agent2.lr * td_err_2
+        agent2.qtable[state, a2] = new_q2
+
+        # snapshot current Q-row (for the state we just updated)
+        qrow1 = agent1.qtable[state, :].copy()
+        qrow2 = agent2.qtable[state, :].copy()
+
+        logs.append({
+            "t": t,
+            "state_idx": int(state),
+            "s1": int(info["s1"]), "s2": int(info["s2"]),
+            "s1_yx": info["s1_yx"], "s2_yx": info["s2_yx"],
+            "action_a1": int(a1), "action_a1_name": ACTION_NAMES[a1],
+            "action_a2": int(a2), "action_a2_name": ACTION_NAMES[a2],
+            "ns_idx": int(ns),
+            "ns1": int(info["ns1"]), "ns2": int(info["ns2"]),
+            "ns1_yx": info["ns1_yx"], "ns2_yx": info["ns2_yx"],
+            # reward breakdown
+            "r_env_1": info["r_env_1"], "r_env_2": info["r_env_2"],
+            "base_step_penalty": info["base_step_penalty"],
+            "proximity_gain": info["proximity_gain"],
+            "hole_penalty": info["hole_penalty"],
+            "dist_before": info["dist_before"], "dist_after": info["dist_after"],
+            "total_reward": info["total_reward"],
+            # Q-update math
+            "old_q1": old_q1, "target_1": target_1, "td_err_1": td_err_1, "new_q1": new_q1,
+            "old_q2": old_q2, "target_2": target_2, "td_err_2": td_err_2, "new_q2": new_q2,
+            # Q row snapshots
+            "qrow1_L": qrow1[0], "qrow1_D": qrow1[1], "qrow1_R": qrow1[2], "qrow1_U": qrow1[3],
+            "qrow2_L": qrow2[0], "qrow2_D": qrow2[1], "qrow2_R": qrow2[2], "qrow2_U": qrow2[3],
+            "done": bool(done),
+        })
+
+        state = ns
+        if done:
+            break
+
+    # restore epsilons
+    agent1.epsilon, agent2.epsilon = eps1_bak, eps2_bak
+
+    df = pd.DataFrame(logs)
+    if save_csv:
+        df.to_csv(csv_path, index=False)
+        print(f"[debug] Saved step-by-step log to {csv_path}")
+
+    # print first few lines for a quick look
+    if verbose_first_n > 0:
+        print(df.head(verbose_first_n).to_string(index=False))
+
+    return df
+
+
+def plot_qrow_timeseries(df, which_agent=1, save_path="results/debug_qrow_timeseries.png"):
+    """
+    Given the df from debug_episode, plot the Q-row (L,D,R,U) for the CURRENT joint state
+    as it evolves over the episode. Useful to see why a direction becomes preferred.
+    """
+    if which_agent == 1:
+        cols = ["qrow1_L", "qrow1_D", "qrow1_R", "qrow1_U"]
+        title = "Agent 1 Q-row over time (state just updated each step)"
+    else:
+        cols = ["qrow2_L", "qrow2_D", "qrow2_R", "qrow2_U"]
+        title = "Agent 2 Q-row over time (state just updated each step)"
+
+    plt.figure(figsize=(8, 4))
+    for c in cols:
+        plt.plot(df["t"], df[c], label=c.split("_")[-1])
+    plt.title(title)
+    plt.xlabel("Step t in episode")
+    plt.ylabel("Q-value")
+    plt.legend(title="Action")
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.show()
+    plt.close()
+
+
+def best_action_per_cell(agent, env, who=1):
+    """
+    For each physical cell of 'who' (1 or 2), pick the action that maximizes
+    the sum of Q-values over ALL positions of the other agent.
+    Returns (best_action_grid, best_value_grid) of shape (n, n).
+    """
+    n = env.n
+    nS = env.n_states
+    best_act = np.zeros((n, n), dtype=int)
+    best_val = np.zeros((n, n), dtype=float)
+
+    for r in range(n):
+        for c in range(n):
+            sk = env.pos_to_idx((r, c))  # this agent's scalar state at (r,c)
+            scores = np.zeros(4, dtype=float)
+
+            if who == 1:
+                # sum over all s2
+                for s2 in range(nS):
+                    scores += agent.qtable[env.encode_state(sk, s2), :]
+            else:
+                # sum over all s1
+                for s1 in range(nS):
+                    scores += agent.qtable[env.encode_state(s1, sk), :]
+
+            a = int(np.argmax(scores))
+            best_act[r, c] = a
+            best_val[r, c] = scores[a]
+    return best_act, best_val
+
+
+def plot_agent_best_maps_combined(agent1, agent2, env):
+    """
+    One physical map. For each cell, draw both agents’ best actions
+    (max over the other agent’s position). Arrows are offset so they don’t overlap.
+    No arrows on holes or the goal. Uses flipped Y to match background tiles.
+    """
+    n = env.n
+    desc = env.desc
+    color_map = {"S": "#90ee90", "F": "#add8e6", "H": "#d3d3d3", "G": "#ffd700"}
+
+    # Best action per physical cell for each agent
+    agrid1, _ = best_action_per_cell(agent1, env, who=1)
+    agrid2, _ = best_action_per_cell(agent2, env, who=2)
+
+    fig, ax = plt.subplots(figsize=(6.5, 6.5))
+    ax.set_title("Best Option per Cell (A1=Black, A2=Orange)\n(no arrows on holes or goal)")
+
+    # --- draw map (note the vertical flip: y = n - i - 1) ---
+    for i in range(n):
+        for j in range(n):
+            tile = desc[i, j]
+            ax.add_patch(
+                plt.Rectangle((j, n - i - 1), 1, 1,
+                              color=color_map.get(tile, "white"), ec="black", lw=0.7)
+            )
+            ax.text(j + 0.5, n - i - 0.5, tile, ha="center", va="center",
+                    fontsize=12, weight="bold", color="black")
+
+    ax.set_xlim(0, n);
+    ax.set_ylim(0, n)
+    ax.set_xticks(range(n + 1));
+    ax.set_yticks(range(n + 1))
+    ax.grid(True, color="black", linewidth=0.4)
+    ax.set_aspect('equal')
+
+    # ---- centers in *plot* coordinates (flip Y to match tiles) ----
+    Xc_grid, Yc_grid = np.meshgrid(np.arange(n) + 0.5, np.arange(n) + 0.5)  # array coords
+    Xc = Xc_grid
+    Yc = n - Yc_grid  # <-- flip so row 0 appears at bottom
+
+    def draw_for_agent(agrid, agent_id):
+        offx, offy = AGENT_OFFSETS[agent_id]
+        U = np.zeros_like(Xc, dtype=float);
+        V = np.zeros_like(Yc, dtype=float)
+        M = np.zeros_like(Xc, dtype=bool)
+
+        for i in range(n):
+            for j in range(n):
+                tile = desc[i, j]
+                if tile in ("H", "G"):
+                    M[i, j] = False
+                    continue
+                dy, dx = ACTION_VEC[int(agrid[i, j])]
+                # convert grid motion (row+,col+) to plot coords (x right, y up)
+                U[i, j] = dx
+                V[i, j] = -dy
+                M[i, j] = True
+
+        ax.quiver(Xc[M] + offx, Yc[M] + offy, U[M], V[M],
+                  color=AGENT_COLORS[agent_id], alpha=0.95, **ARROW_STYLE)
+
+    # draw both agents on the same map
+    draw_for_agent(agrid1, 1)
+    draw_for_agent(agrid2, 2)
+
+    # legend
+    ax.plot([], [], color=AGENT_COLORS[1], label="Agent 1")
+    ax.plot([], [], color=AGENT_COLORS[2], label="Agent 2")
+    ax.legend(loc="upper left")
+
+    plt.tight_layout()
+    plt.savefig("results/agent_best_per_cell_combined.png", bbox_inches="tight", dpi=200)
+    plt.show();
+    plt.close(fig)
+
+
+# ============================================================
+#                           RUN
+# ============================================================
+if __name__ == "__main__":
+    env, agent1, agent2, rewards, steps, mean_q1, mean_q2 = \
+        train_two_agents_representative(
+            episodes_per_start=1000,  # 8–20 works well on 4x4
+            map_size=4,
+            seed=123,
+            include_goal_starts=False,  # usually better to exclude
+            max_steps=200,
+            eps_start=0.4, eps_end=0.05
+        )
+    # 1) normal plots
+    # plot_training_statistics(rewards, steps, mean_q1, mean_q2, epsilons)
+    plot_frozenlake_map(env)
+    plot_joint_policy(agent1, agent2, env)
+
+    # 2) step-by-step debug of ONE episode (greedy to read the learned policy directly)
+    # df_debug = debug_episode(env, agent1, agent2,
+    #                          max_steps=100, greedy=True,
+    #                          csv_path="results/debug_episode_log.csv",
+    #                          save_csv=True, verbose_first_n=12)
+
+    # 3) optional: visualize the evolving Q-row of the updated state
+    # plot_qrow_timeseries(df_debug, which_agent=1, save_path="results/debug_qrow_timeseries_agent1.png")
+    # plot_qrow_timeseries(df_debug, which_agent=2, save_path="results/debug_qrow_timeseries_agent2.png")
+    plot_agent_best_maps_combined(agent1, agent2, env)
