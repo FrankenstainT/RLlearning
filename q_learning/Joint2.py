@@ -294,7 +294,7 @@ def train_two_agents_representative(
             mean_q2.append(np.mean(agent2.qtable))
             epsilons.append(agent1.epsilon)
 
-    return env, agent1, agent2, rewards, steps, mean_q1, mean_q2, episilons
+    return env, agent1, agent2, rewards, steps, mean_q1, mean_q2, epsilons
 
 
 # ============================================================
