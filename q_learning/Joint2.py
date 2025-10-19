@@ -115,9 +115,14 @@ class TwoAgentFrozenLake:
         ny2, nx2 = (y2, x2) if (y2, x2) == self.goal else self.move(y2, x2, a2)
 
         tile1, tile2 = self.desc[ny1, nx1], self.desc[ny2, nx2]
-
+        r1 = 0
+        r2 = 0
         # If any agent falls into a hole: terminal with -1.0 (match step)
         if tile1 == "H" or tile2 == "H":
+            if tile1 == 'H':
+                r1 = -1
+            if tile2 =='H':
+                r2 = -1
             self.current_state = ((ny1, nx1), (ny2, nx2))
             next_state = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
             info = {
@@ -131,7 +136,8 @@ class TwoAgentFrozenLake:
                 "proximity_gain": 0.0,
                 "hole_penalty": -1.0,
                 "dist_before": None, "dist_after": None,
-                "total_reward": -1.0,
+                "reward_r1": r1,
+                "reward_r2":r2,
                 "done": True,
                 "tile1": tile1, "tile2": tile2,
             }
@@ -517,7 +523,8 @@ def debug_episode(env, agent1, agent2, max_steps=200, greedy=True,
             "proximity_gain": info["proximity_gain"],
             "hole_penalty": info["hole_penalty"],
             "dist_before": info["dist_before"], "dist_after": info["dist_after"],
-            "total_reward": info["total_reward"],
+            "reward_r1": info["reward_r1"],
+            "reward_r2": info["reward_r2"],
             # Q-update math
             "old_q1": old_q1, "target_1": target_1, "td_err_1": td_err_1, "new_q1": new_q1,
             "old_q2": old_q2, "target_2": target_2, "td_err_2": td_err_2, "new_q2": new_q2,
