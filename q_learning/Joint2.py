@@ -92,11 +92,11 @@ class TwoAgentFrozenLake:
         dist_before = abs(gy - y1) + abs(gx - x1) + abs(gy - y2) + abs(gx - x2)
         dist_after = abs(gy - ny1) + abs(gx - nx1) + abs(gy - ny2) + abs(gx - nx2)
         reward += 0.02 * (dist_before - dist_after)
-
-        if tile1 == "H" or tile2 == "H":
-            reward -= 0.5  # hole penalty
-
         done = (tile1 == "G" and tile2 == "G")
+        if tile1 == "H" or tile2 == "H":
+            reward = 0  # hole penalty
+            done = True
+
         self.current_state = ((ny1, nx1), (ny2, nx2))
         next_state = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
         return next_state, reward, done
