@@ -227,7 +227,7 @@ def train_two_agents_representative(
     # Build representative start list: all safe x safe (overlap allowed)
     safe = env.safe_indices(include_goal=include_goal_starts)
     #start_pairs = [(s1, s2) for s1 in safe for s2 in safe]
-    start_pairs = [(0,0) for _ in range(30)]
+    start_pairs = [(0,0) for _ in range(10)]
     rng.shuffle(start_pairs)
     total_episodes = len(start_pairs) * episodes_per_start
     ep_counter = 0
@@ -662,6 +662,37 @@ def plot_agent_best_maps_combined(agent1, agent2, env):
     plt.savefig("results/agent_best_per_cell_combined.png", bbox_inches="tight", dpi=200)
     plt.show()
     plt.close(fig)
+# --- NEW: saving utility ------------------------------------------------------
+def save_qtables(env, agent1, agent2,
+                 out_npz="results/qtables_final.npz",
+                 out_csv_prefix="results/qtable_agent"):
+    """
+    Save the two Q-tables to disk.
+
+    - NPZ (compressed): includes both tables + map metadata.
+    - CSVs: one file per agent (handy for quick inspection).
+    """
+    os.makedirs(os.path.dirname(out_npz), exist_ok=True)
+
+    # compressed bundle with metadata
+    np.savez_compressed(
+        out_npz,
+        agent1_q=agent1.qtable,
+        agent2_q=agent2.qtable,
+        map_desc=np.asarray(env.desc),
+        n=np.int64(env.n),
+        n_states=np.int64(env.n_states),
+        n_actions=np.int64(env.n_actions),
+        goal_row=np.int64(env.goal[0]),
+        goal_col=np.int64(env.goal[1]),
+    )
+
+    # optional human-friendly CSVs (one per agent)
+    np.savetxt(f"{out_csv_prefix}1.csv", agent1.qtable, delimiter=",")
+    np.savetxt(f"{out_csv_prefix}2.csv", agent2.qtable, delimiter=",")
+
+    print(f"[saved] NPZ -> {out_npz}")
+    print(f"[saved] CSV -> {out_csv_prefix}1.csv, {out_csv_prefix}2.csv")
 
 
 # ============================================================
@@ -677,6 +708,8 @@ if __name__ == "__main__":
             max_steps=200,
             eps_start=0.4, eps_end=0.05
         )
+    # <-- save the final Q-tables
+    save_qtables(env, agent1, agent2)
     # 1) normal plots
     plot_training_statistics(rewards, steps, mean_q1, mean_q2)
     plot_frozenlake_map(env)
