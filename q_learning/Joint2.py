@@ -353,7 +353,7 @@ def plot_joint_policy(agent1, agent2, env):
     def is_safe_idx(idx):
         r, c = env.idx_to_pos(idx)
         t = env.desc[r, c]
-        return t in ("S", "F")
+        return t in ("S", "F", "G")
 
     safe_1 = np.array([is_safe_idx(i) for i in range(nS)])  # agent1 rows
     safe_2 = np.array([is_safe_idx(i) for i in range(nS)])  # agent2 cols
@@ -534,32 +534,49 @@ def plot_qrow_timeseries(df, which_agent=1, save_path="results/debug_qrow_timese
 def best_action_per_cell(agent, env, who=1):
     """
     For each physical cell of 'who' (1 or 2), pick the action that maximizes
-    the sum of Q-values over ALL positions of the other agent.
+    the sum of Q-values over ALL positions of the *other* agent,
+    but only counting other-agent states that are SAFE tiles (S or F).
     Returns (best_action_grid, best_value_grid) of shape (n, n).
     """
-    n = env.n
-    nS = env.n_states
+    n, nS = env.n, env.n_states
     best_act = np.zeros((n, n), dtype=int)
     best_val = np.zeros((n, n), dtype=float)
 
+    # mask of safe scalar indices (S or F) for either agent
+    safe_mask = np.zeros(nS, dtype=bool)
+    for idx in range(nS):
+        r, c = env.idx_to_pos(idx)
+        safe_mask[idx] = env.desc[r, c] in ("S", "F", "G")
+
+    safe_idxs = np.nonzero(safe_mask)[0]
+
     for r in range(n):
         for c in range(n):
+            tile = env.desc[r, c]
+            if tile in ("H", "G"):
+                # nothing to compute for an unsafe/self-terminal cell
+                best_act[r, c] = 0
+                best_val[r, c] = np.nan
+                continue
+
             sk = env.pos_to_idx((r, c))  # this agent's scalar state at (r,c)
-            scores = np.zeros(4, dtype=float)
 
             if who == 1:
-                # sum over all s2
-                for s2 in range(nS):
-                    scores += agent.qtable[env.encode_state(sk, s2), :]
+                # rows where agent1 is fixed at sk and agent2 varies over SAFE tiles
+                rows = [env.encode_state(sk, s2) for s2 in safe_idxs]
             else:
-                # sum over all s1
-                for s1 in range(nS):
-                    scores += agent.qtable[env.encode_state(s1, sk), :]
+                # rows where agent2 is fixed at sk and agent1 varies over SAFE tiles
+                rows = [env.encode_state(s1, sk) for s1 in safe_idxs]
+
+            # sum Q-values over those rows only (ignore holes/goal for the other agent)
+            scores = agent.qtable[rows, :].sum(axis=0)
 
             a = int(np.argmax(scores))
             best_act[r, c] = a
             best_val[r, c] = scores[a]
+
     return best_act, best_val
+
 
 
 def plot_agent_best_maps_combined(agent1, agent2, env):
