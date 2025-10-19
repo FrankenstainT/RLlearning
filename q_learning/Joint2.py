@@ -73,7 +73,6 @@ class TwoAgentFrozenLake:
 
     def step(self, a1, a2):
         (y1, x1), (y2, x2) = self.current_state
-        (y1, x1), (y2, x2) = self.current_state
         if (y1, x1) == self.goal:
             ny1, nx1 = y1, x1
         else:
@@ -83,9 +82,13 @@ class TwoAgentFrozenLake:
         else:
             ny2, nx2 = self.move(y2, x2, a2)
         tile1, tile2 = self.desc[ny1, nx1], self.desc[ny2, nx2]
+        if tile1 == "H" or tile2 == "H":
+            self.current_state = ((ny1, nx1), (ny2, nx2))
+            ns = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
+            return ns, -1.0, True
+        r1 = 1.0 if (y1, x1) != self.goal and (ny1, nx1) == self.goal else 0.0
+        r2 = 1.0 if (y2, x2) != self.goal and (ny2, nx2) == self.goal else 0.0
 
-        r1 = 1.0 if tile1 == "G" else 0.0
-        r2 = 1.0 if tile2 == "G" else 0.0
         reward = r1 + r2 - 0.01  # base step penalty
 
         gy, gx = self.goal
@@ -93,9 +96,6 @@ class TwoAgentFrozenLake:
         dist_after = abs(gy - ny1) + abs(gx - nx1) + abs(gy - ny2) + abs(gx - nx2)
         reward += 0.02 * (dist_before - dist_after)
         done = (tile1 == "G" and tile2 == "G")
-        if tile1 == "H" or tile2 == "H":
-            reward = 0  # hole penalty
-            done = True
 
         self.current_state = ((ny1, nx1), (ny2, nx2))
         next_state = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
@@ -243,7 +243,7 @@ def train_two_agents_representative(
         # anneal epsilon within this mini-batch
         agent1.epsilon = eps_start
         agent2.epsilon = eps_start
-        eps_decay = .99  # (eps_end / eps_start) ** (1.0 / max(1, episodes_per_start - 1))
+        #eps_decay = .99  # (eps_end / eps_start) ** (1.0 / max(1, episodes_per_start - 1))
 
         for _ in range(episodes_per_start):
             # GLIE-style schedules (global, not reset per start)
@@ -257,13 +257,20 @@ def train_two_agents_representative(
             done, total_r, t = False, 0.0, 0
 
             while not done and t < max_steps:
-                a1 = agent1.choose_action(state)
-                a2 = agent2.choose_action(state)
+                # Is an agent already parked on the goal at the *current* state?
+                s1_idx_curr, s2_idx_curr = env.decode_state(state)
+                at_goal1 = env.idx_to_pos(s1_idx_curr) == env.goal
+                at_goal2 = env.idx_to_pos(s2_idx_curr) == env.goal
+                # Choose actions (frozen agents take a no-op placeholder)
+                a1 = 1 if at_goal1 else agent1.choose_action(state)
+                a2 = 1 if at_goal2 else agent2.choose_action(state)
                 ns, r, done = env.step(a1, a2)
 
-                # no bootstrap at terminal (agent.update handles it via 'done')
-                agent1.update(state, a1, r, ns)
-                agent2.update(state, a2, r, ns)
+                # Update only agents that are not already waiting on the goal
+                if not at_goal1:
+                    agent1.update(state, a1, r, ns)
+                if not at_goal2:
+                    agent2.update(state, a2, r, ns)
 
                 state = ns
                 total_r += r
