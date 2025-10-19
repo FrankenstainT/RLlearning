@@ -219,7 +219,9 @@ def train_two_agents_representative(
         include_goal_starts=False,
         max_steps=200,
         eps_start=0.4,
-        eps_end=0.05
+        eps_end=0.05,
+        alpha_start = 0.8,
+        alpha_end = 0.2,
 ):
     env = TwoAgentFrozenLake(map_size=map_size, seed=seed)
     rng = np.random.default_rng(seed)
@@ -233,7 +235,8 @@ def train_two_agents_representative(
     safe = env.safe_indices(include_goal=include_goal_starts)
     start_pairs = [(s1, s2) for s1 in safe for s2 in safe]
     rng.shuffle(start_pairs)
-
+    total_episodes = len(start_pairs) * episodes_per_start
+    ep_counter = 0
     rewards, steps, mean_q1, mean_q2 = [], [], [], []
 
     for (s1_idx, s2_idx) in tqdm(start_pairs, desc="Start pairs"):
@@ -243,6 +246,13 @@ def train_two_agents_representative(
         eps_decay = .99  # (eps_end / eps_start) ** (1.0 / max(1, episodes_per_start - 1))
 
         for _ in range(episodes_per_start):
+            # GLIE-style schedules (global, not reset per start)
+            frac = ep_counter / max(1, total_episodes - 1)
+            eps = eps_start + (eps_end - eps_start) * frac
+            alpha = alpha_start + (alpha_end - alpha_start) * frac
+            agent1.epsilon = agent2.epsilon = max(eps_end, eps)
+            agent1.lr = agent2.lr = max(alpha_end, alpha)
+
             state = env.reset_to_indices(s1_idx, s2_idx)
             done, total_r, t = False, 0.0, 0
 
@@ -260,9 +270,9 @@ def train_two_agents_representative(
                 t += 1
 
             # per-episode epsilon decay within the same start
-            agent1.epsilon = max(eps_end, agent1.epsilon * eps_decay)
-            agent2.epsilon = max(eps_end, agent2.epsilon * eps_decay)
-
+            # agent1.epsilon = max(eps_end, agent1.epsilon * eps_decay)
+            # agent2.epsilon = max(eps_end, agent2.epsilon * eps_decay)
+            ep_counter += 1
             rewards.append(total_r);
             steps.append(t)
             mean_q1.append(np.mean(agent1.qtable));
@@ -333,17 +343,27 @@ def plot_frozenlake_map(env):
 
 
 def plot_joint_policy(agent1, agent2, env):
-    nS = env.n_states  # number of scalar positions per agent (n*n)
+    nS = env.n_states  # scalar positions per agent (n*n)
 
     # Best action per joint state (row = pos(agent1), col = pos(agent2))
     q_best1 = np.argmax(agent1.qtable, axis=1).reshape(nS, nS)
     q_best2 = np.argmax(agent2.qtable, axis=1).reshape(nS, nS)
 
+    # --- build "safe" masks for each scalar index (no H or G) ---
+    def is_safe_idx(idx):
+        r, c = env.idx_to_pos(idx)
+        t = env.desc[r, c]
+        return t in ("S", "F")
+
+    safe_1 = np.array([is_safe_idx(i) for i in range(nS)])  # agent1 rows
+    safe_2 = np.array([is_safe_idx(i) for i in range(nS)])  # agent2 cols
+    # joint mask: only plot where BOTH agents are on safe tiles
+    M = np.outer(safe_1, safe_2)  # shape (nS, nS), True = keep
+
+    # Quiver fields
     Y, X = np.mgrid[0:nS, 0:nS]
-    U1 = np.zeros_like(X, dtype=float);
-    V1 = np.zeros_like(Y, dtype=float)
-    U2 = np.zeros_like(X, dtype=float);
-    V2 = np.zeros_like(Y, dtype=float)
+    U1 = np.zeros_like(X, dtype=float); V1 = np.zeros_like(Y, dtype=float)
+    U2 = np.zeros_like(X, dtype=float); V2 = np.zeros_like(Y, dtype=float)
 
     for s1 in range(nS):
         for s2 in range(nS):
@@ -353,7 +373,8 @@ def plot_joint_policy(agent1, agent2, env):
             U2[s1, s2], V2[s1, s2] = dx2, dy2
 
     fig, ax = plt.subplots(figsize=(12, 10))
-    ax.set_title("Joint Q-table Policy (Agent1=Black, Agent2=Orange)\nAxes show ALL coordinates (row, col)")
+    ax.set_title("Joint Q-table Policy (Agent1=Black, Agent2=Orange)\n"
+                 "Axes show ALL coordinates (row, col)")
 
     ax.set_xlim(-0.5, nS - 0.5)
     ax.set_ylim(nS - 0.5, -0.5)
@@ -362,19 +383,22 @@ def plot_joint_policy(agent1, agent2, env):
     ax.grid(True, linestyle="--", linewidth=0.4)
 
     # Offsets so arrows don’t overlap
-    off1x, off1y = AGENT_OFFSETS[1];
-    off2x, off2y = AGENT_OFFSETS[2]
-    ax.quiver(X + off1x, Y + off1y, U1, V1, color=AGENT_COLORS[1], alpha=0.85, **ARROW_STYLE)
-    ax.quiver(X + off2x, Y + off2y, U2, V2, color=AGENT_COLORS[2], alpha=0.85, **ARROW_STYLE)
+    off1x, off1y = AGENT_OFFSETS[1]; off2x, off2y = AGENT_OFFSETS[2]
 
-    # ---- Mark ALL coordinates (0..15) on both axes as (row,col) ----
+    # --- PLOT ONLY WHERE MASK == True ---
+    ax.quiver(X[M] + off1x, Y[M] + off1y, U1[M], V1[M],
+              color=AGENT_COLORS[1], alpha=0.85, **ARROW_STYLE)
+    ax.quiver(X[M] + off2x, Y[M] + off2y, U2[M], V2[M],
+              color=AGENT_COLORS[2], alpha=0.85, **ARROW_STYLE)
+
+    # ticks as (row,col)
     ticks = np.arange(nS)
     ax.set_xticks(ticks)
     ax.set_yticks(ticks)
     ax.set_xticklabels([str(env.idx_to_pos(i)) for i in ticks], rotation=90, fontsize=8)
     ax.set_yticklabels([str(env.idx_to_pos(i)) for i in ticks], fontsize=8)
 
-    # Show where the goal lies (as cross lines at its scalar index)
+    # goal guides (just lines, no arrows on those rows/cols because mask blocks them)
     g_idx = env.pos_to_idx(env.goal)
     ax.axvline(g_idx, color="green", linestyle="--", linewidth=1)
     ax.axhline(g_idx, color="green", linestyle="--", linewidth=1)
@@ -382,8 +406,8 @@ def plot_joint_policy(agent1, agent2, env):
 
     plt.tight_layout()
     plt.savefig("results/joint_policy_map_quiver.png", bbox_inches="tight", dpi=200)
-    plt.show();
-    plt.close(fig)
+    plt.show(); plt.close(fig)
+
 
 
 ACTION_NAMES = {0: "LEFT", 1: "DOWN", 2: "RIGHT", 3: "UP"}
