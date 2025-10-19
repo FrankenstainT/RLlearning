@@ -478,13 +478,13 @@ def debug_episode(env, agent1, agent2, max_steps=200, greedy=True,
         a2 = 1 if at_goal2 else (np.argmax(agent2.qtable[state, :]) if greedy else agent2.choose_action(state))
 
         # step with info
-        ns, reward, done, info = env.step_with_info(a1, a2)
+        ns, r1, r2, done, info = env.step_with_info(a1, a2)
 
         # ----- compute & apply Q-updates (same as your learner) -----
         # Agent 1
         old_q1 = agent1.qtable[state, a1]
         best_next_1 = np.max(agent1.qtable[ns, :])
-        target_1 = reward + agent1.gamma * best_next_1
+        target_1 = r1 + agent1.gamma * best_next_1
         td_err_1 = target_1 - old_q1
         new_q1 = old_q1 + agent1.lr * td_err_1
         agent1.qtable[state, a1] = new_q1
@@ -492,7 +492,7 @@ def debug_episode(env, agent1, agent2, max_steps=200, greedy=True,
         # Agent 2
         old_q2 = agent2.qtable[state, a2]
         best_next_2 = np.max(agent2.qtable[ns, :])
-        target_2 = reward + agent2.gamma * best_next_2
+        target_2 = r2 + agent2.gamma * best_next_2
         td_err_2 = target_2 - old_q2
         new_q2 = old_q2 + agent2.lr * td_err_2
         agent2.qtable[state, a2] = new_q2
