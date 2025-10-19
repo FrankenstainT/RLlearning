@@ -284,7 +284,7 @@ def train_two_agents_representative(
 # ============================================================
 #                       VISUALIZATION
 # ============================================================
-def plot_training_statistics(rewards, steps, mean_q1, mean_q2, epsilons):
+def plot_training_statistics(rewards, steps, mean_q1, mean_q2):
     def smooth(x, k=100):
         return np.convolve(x, np.ones(k) / k, mode="valid")
 
@@ -304,9 +304,9 @@ def plot_training_statistics(rewards, steps, mean_q1, mean_q2, epsilons):
     ax[2].set_title("Mean Q-values")
     ax[2].set_ylabel("Q")
 
-    ax[3].plot(epsilons)
-    ax[3].set_title("Epsilon Decay (Exploration Rate)")
-    ax[3].set_ylabel("Epsilon")
+    # ax[3].plot(epsilons)
+    # ax[3].set_title("Epsilon Decay (Exploration Rate)")
+    # ax[3].set_ylabel("Epsilon")
 
     plt.xlabel("Episode")
     plt.tight_layout()
@@ -669,7 +669,7 @@ if __name__ == "__main__":
             eps_start=0.4, eps_end=0.05
         )
     # 1) normal plots
-    # plot_training_statistics(rewards, steps, mean_q1, mean_q2, epsilons)
+    plot_training_statistics(rewards, steps, mean_q1, mean_q2)
     plot_frozenlake_map(env)
     plot_joint_policy(agent1, agent2, env)
 
