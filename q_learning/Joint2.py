@@ -110,14 +110,28 @@ class TwoAgentFrozenLake:
 
         tile1, tile2 = self.desc[ny1, nx1], self.desc[ny2, nx2]
 
-        # hole is terminal, reward = -1.0  (match step)
+        # If any agent falls into a hole: terminal with -1.0 (match step)
         if tile1 == "H" or tile2 == "H":
             self.current_state = ((ny1, nx1), (ny2, nx2))
             next_state = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
-            info = {...}  # keep your fields, set totals to -1.0 and done=True
-            info.update(total_reward=-1.0, hole_penalty=-1.0, done=True)
+            info = {
+                "s1": self.pos_to_idx((y1, x1)), "s2": self.pos_to_idx((y2, x2)),
+                "ns1": self.pos_to_idx((ny1, nx1)), "ns2": self.pos_to_idx((ny2, nx2)),
+                "s1_yx": (y1, x1), "s2_yx": (y2, x2),
+                "ns1_yx": (ny1, nx1), "ns2_yx": (ny2, nx2),
+                "a1": a1, "a2": a2,
+                "r_env_1": 0.0, "r_env_2": 0.0,
+                "base_step_penalty": 0.0,
+                "proximity_gain": 0.0,
+                "hole_penalty": -1.0,
+                "dist_before": None, "dist_after": None,
+                "total_reward": -1.0,
+                "done": True,
+                "tile1": tile1, "tile2": tile2,
+            }
             return next_state, -1.0, True, info
 
+        # normal step (same shaping as step())
         r1 = 1.0 if (y1, x1) != self.goal and (ny1, nx1) == self.goal else 0.0
         r2 = 1.0 if (y2, x2) != self.goal and (ny2, nx2) == self.goal else 0.0
         reward = r1 + r2 - 0.01
@@ -129,6 +143,7 @@ class TwoAgentFrozenLake:
         reward += proximity_gain
 
         done = (tile1 == "G" and tile2 == "G")
+
         self.current_state = ((ny1, nx1), (ny2, nx2))
         next_state = self.encode_state(self.pos_to_idx((ny1, nx1)), self.pos_to_idx((ny2, nx2)))
 
@@ -232,11 +247,9 @@ def train_two_agents_representative(
     total_episodes = len(start_pairs) * episodes_per_start
     ep_counter = 0
     rewards, steps, mean_q1, mean_q2 = [], [], [], []
-
+    agent1.epsilon = eps_start
+    agent2.epsilon = eps_start
     for (s1_idx, s2_idx) in tqdm(start_pairs, desc="Start pairs"):
-        # anneal epsilon within this mini-batch
-        agent1.epsilon = eps_start
-        agent2.epsilon = eps_start
         # eps_decay = .99  # (eps_end / eps_start) ** (1.0 / max(1, episodes_per_start - 1))
 
         for _ in range(episodes_per_start):
@@ -701,12 +714,12 @@ def save_qtables(env, agent1, agent2,
 if __name__ == "__main__":
     env, agent1, agent2, rewards, steps, mean_q1, mean_q2 = \
         train_two_agents_representative(
-            episodes_per_start=1000,  # 8–20 works well on 4x4
+            episodes_per_start=3000,  # 8–20 works well on 4x4
             map_size=4,
             seed=123,
             include_goal_starts=False,  # usually better to exclude
-            max_steps=200,
-            eps_start=0.4, eps_end=0.05
+            max_steps=100,
+            eps_start=0.2, eps_end=0.02
         )
     # <-- save the final Q-tables
     save_qtables(env, agent1, agent2)
