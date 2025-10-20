@@ -267,9 +267,9 @@ def train_two_agents_representative(
         # eps_decay = .99  # (eps_end / eps_start) ** (1.0 / max(1, episodes_per_start - 1))
         agent1.epsilon = eps_start
         agent2.epsilon = eps_start
-        for _ in range(episodes_per_start):
+        for sep in range(episodes_per_start):
             # GLIE-style schedules (global, not reset per start)
-            frac = ep_counter / max(1, total_episodes - 1)
+            frac = sep / max(1, episodes_per_start - 1)
             eps = eps_start + (eps_end - eps_start) * frac
             alpha = alpha_start + (alpha_end - alpha_start) * frac
             agent1.epsilon = agent2.epsilon = max(eps_end, eps)
