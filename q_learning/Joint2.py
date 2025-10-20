@@ -38,7 +38,7 @@ class TwoAgentFrozenLake:
         self.goal = (self.n - 1, self.n - 1)
         self.current_state = None
         self.step_penalty = -0.08
-        self.stay_penalty = -.3
+        self.stay_penalty = -.5
 
     # ----- Coordinate helpers -----
     def encode_state(self, s1, s2):
@@ -748,7 +748,7 @@ def save_qtables(env, agent1, agent2,
 if __name__ == "__main__":
     env, agent1, agent2, rewards, steps, mean_q1, mean_q2, epsilons = \
         train_two_agents_representative(
-            episodes_per_start=20000,  # 8–20 works well on 4x4
+            episodes_per_start=30000,  # 8–20 works well on 4x4
             map_size=4,
             seed=123,
             max_steps=30,
