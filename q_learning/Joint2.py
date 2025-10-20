@@ -262,11 +262,11 @@ def train_two_agents_representative(
     ep_counter = 0
     rewards, steps, mean_q1, mean_q2 = [], [], [], []
     epsilons = []  # <--- add this
-    agent1.epsilon = eps_start
-    agent2.epsilon = eps_start
+
     for (s1_idx, s2_idx) in tqdm(start_pairs, desc="Start pairs"):
         # eps_decay = .99  # (eps_end / eps_start) ** (1.0 / max(1, episodes_per_start - 1))
-
+        agent1.epsilon = eps_start
+        agent2.epsilon = eps_start
         for _ in range(episodes_per_start):
             # GLIE-style schedules (global, not reset per start)
             frac = ep_counter / max(1, total_episodes - 1)
