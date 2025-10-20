@@ -257,7 +257,11 @@ def train_two_agents_representative(
     safe = env.safe_indices()
     start_pairs = [(s1, s2) for s1 in safe for s2 in safe]
     #start_pairs = [(0, 0) for _ in range(10)]
-    rng.shuffle(start_pairs)
+    start_pairs = sorted(
+        [(s1, s2) for s1 in safe for s2 in safe],
+        key=lambda p: p[0] + p[1],
+        reverse=True
+    )
     total_episodes = len(start_pairs) * episodes_per_start
     ep_counter = 0
     rewards, steps, mean_q1, mean_q2 = [], [], [], []
@@ -275,7 +279,7 @@ def train_two_agents_representative(
             eps_used = max(eps_end, eps_state)  # use the strongest exploration need
             agent1.epsilon = agent2.epsilon = eps_used
             alpha = max(eps_used/2, 0.1)
-            agent1.lr = agent2.lr = max(alpha_end, alpha)
+            agent1.lr = agent2.lr = 0.2#max(alpha_end, alpha)
 
 
             done, total_r, t = False, 0.0, 0
