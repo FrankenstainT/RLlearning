@@ -262,17 +262,18 @@ def train_two_agents_representative(
     ep_counter = 0
     rewards, steps, mean_q1, mean_q2 = [], [], [], []
     epsilons = []  # <--- add this
-
+    state_visits = np.zeros(env.n_states ** 2, dtype=np.int32)
+    c = 10.0  # controls strength of the visit-based bonus
+    agent1.epsilon = eps_start
+    agent2.epsilon = eps_start
     for (s1_idx, s2_idx) in tqdm(start_pairs, desc="Start pairs"):
         # eps_decay = .99  # (eps_end / eps_start) ** (1.0 / max(1, episodes_per_start - 1))
-        agent1.epsilon = eps_start
-        agent2.epsilon = eps_start
+
         for sep in range(episodes_per_start):
-            # GLIE-style schedules (global, not reset per start)
-            frac = sep / max(1, episodes_per_start - 1)
-            eps = eps_start + (eps_end - eps_start) * frac
-            alpha = alpha_start + (alpha_end - alpha_start) * frac
-            agent1.epsilon = agent2.epsilon = max(eps_end, eps)
+            eps_state = c / (c + state_visits[state])  # higher when state is rare
+            eps_used = max(eps_end, eps_state)  # use the strongest exploration need
+            agent1.epsilon = agent2.epsilon = eps_used
+            alpha = max(eps_used/2, 0.1)
             agent1.lr = agent2.lr = max(alpha_end, alpha)
 
             state = env.reset_to_indices(s1_idx, s2_idx)
@@ -286,6 +287,7 @@ def train_two_agents_representative(
                 # Choose actions (frozen agents take a no-op placeholder)
                 a1 = 1 if at_goal1 else agent1.choose_action(state)
                 a2 = 1 if at_goal2 else agent2.choose_action(state)
+                state_visits[state] += 1
                 ns, r1, r2, done = env.step(a1, a2)
 
                 # Update only agents that are not already waiting on the goal
@@ -741,7 +743,7 @@ if __name__ == "__main__":
             map_size=4,
             seed=123,
             max_steps=30,
-            eps_start=0.4, eps_end=0.02
+            eps_start=0.2, eps_end=0.02
         )
 
     # <-- save the final Q-tables
