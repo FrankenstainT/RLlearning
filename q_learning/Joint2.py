@@ -270,13 +270,14 @@ def train_two_agents_representative(
         # eps_decay = .99  # (eps_end / eps_start) ** (1.0 / max(1, episodes_per_start - 1))
 
         for sep in range(episodes_per_start):
+            state = env.reset_to_indices(s1_idx, s2_idx)
             eps_state = c / (c + state_visits[state])  # higher when state is rare
             eps_used = max(eps_end, eps_state)  # use the strongest exploration need
             agent1.epsilon = agent2.epsilon = eps_used
             alpha = max(eps_used/2, 0.1)
             agent1.lr = agent2.lr = max(alpha_end, alpha)
 
-            state = env.reset_to_indices(s1_idx, s2_idx)
+
             done, total_r, t = False, 0.0, 0
 
             while not done and t < max_steps:
