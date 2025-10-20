@@ -38,6 +38,7 @@ class TwoAgentFrozenLake:
         self.goal = (self.n - 1, self.n - 1)
         self.current_state = None
         self.step_penalty = -0.08
+        self.stay_penalty = -.3
 
     # ----- Coordinate helpers -----
     def encode_state(self, s1, s2):
@@ -95,7 +96,10 @@ class TwoAgentFrozenLake:
             return ns, r1, r2, True
         r1 = 1.0 if (y1, x1) != self.goal and (ny1, nx1) == self.goal else 0.0
         r2 = 1.0 if (y2, x2) != self.goal and (ny2, nx2) == self.goal else 0.0
-
+        if (y1, x1) != self.goal and (y1, x1) == (ny1, nx1):
+            r1 += self.stay_penalty
+        if (y2, x2) != self.goal and (y2, x2) == (ny2, nx2):
+            r2+= self.stay_penalty
         r1 += self.step_penalty  # base step penalty
         r2 += self.step_penalty
         gy, gx = self.goal
