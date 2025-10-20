@@ -259,11 +259,11 @@ def train_two_agents_representative(
 
     # Build representative start list: all safe x safe (overlap allowed)
     safe = env.safe_indices()
-    start_pairs = [(s1, s2) for s1 in safe for s2 in safe]
+    #start_pairs = [(s1, s2) for s1 in safe for s2 in safe]
     #start_pairs = [(0, 0) for _ in range(10)]
     start_pairs = sorted(
         [(s1, s2) for s1 in safe for s2 in safe],
-        key=lambda p: p[0] + p[1],
+        key=lambda p: sum(env.idx_to_pos(p[0])) + sum(env.idx_to_pos(p[1])),
         reverse=True
     )
     total_episodes = len(start_pairs) * episodes_per_start
@@ -748,7 +748,7 @@ def save_qtables(env, agent1, agent2,
 if __name__ == "__main__":
     env, agent1, agent2, rewards, steps, mean_q1, mean_q2, epsilons = \
         train_two_agents_representative(
-            episodes_per_start=60000,  # 8–20 works well on 4x4
+            episodes_per_start=80000,  # 8–20 works well on 4x4
             map_size=4,
             seed=123,
             max_steps=30,
