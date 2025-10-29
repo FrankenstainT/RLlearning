@@ -1,6 +1,7 @@
 import numpy as np
-import pulp_verify
 import sys
+# at the top of minimax_q_learner.py
+import pulp  # or: import pulp as pl
 
 
 class MiniMaxQLearner():
@@ -62,7 +63,8 @@ class MiniMaxQLearner():
 
     def learn(self, state_after_step, reward, opponent_action):
         self.reward_history.append(reward)
-        self.q[self.state][(self.previous_action, opponent_action)] = self.compute_q(state_after_step, reward, opponent_action)
+        self.q[self.state][(self.previous_action, opponent_action)] = self.compute_q(state_after_step, reward,
+                                                                                     opponent_action)
         self.pi[self.state] = self.compute_pi()
         self.v[self.state] = self.compute_v()
 
@@ -102,18 +104,17 @@ class MiniMaxQLearner():
 
         return np.array([pi[i].value() for i in range(len(self.actions))])
 
-
     def check_new_state(self, state):
-        if state not in self.q.keys():
+        if state not in self.q:
             self.q[state] = {}
-
-        for action1 in self.actions:
-            for action2 in self.actions:
-                if state not in self.pi.keys():
-                    self.pi[state] = np.repeat(1.0 / len(self.actions), len(self.actions))
-                    self.v[state] = np.random.random()
-                if (action1, action2) not in self.q[state].keys():
-                    self.q[state][(action1, action2)] = np.random.random()
+        if state not in self.pi:
+            self.pi[state] = np.repeat(1.0 / len(self.actions), len(self.actions))
+        if state not in self.v:
+            self.v[state] = 0.0
+        for a1 in self.actions:
+            for a2 in self.actions:
+                if (a1, a2) not in self.q[state]:
+                    self.q[state][(a1, a2)] = 0.0
 
     def end_episode(self):
         self.episode_deltas.append(self.episode_max_delta)
