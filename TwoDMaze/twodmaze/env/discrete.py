@@ -328,8 +328,8 @@ if __name__ == "__main__":
     actions = list(range(4))  # up, down, left, right
 
     # --- training loop ---
-    #num_episodes = 30000
-    num_episodes = 1
+    num_episodes = 30000
+    #num_episodes = 1
     init_eps = 0.3
     init_alpha = 0.2
     gamma = 1
