@@ -7,6 +7,7 @@ from matplotlib import colors
 from pettingzoo import ParallelEnv
 from gymnasium import spaces
 import imageio.v2 as imageio  # use v2 to avoid deprecation warning
+import pickle
 
 
 class PursuitEvasionParallelEnv(ParallelEnv):
@@ -262,6 +263,7 @@ class EpsGreedyPolicy:
         else:
             return int(np.random.choice(len(p), p=p))
 
+
 def qtensor_by_state(learner, actions):
     """Return dict: state_key -> (nA x nA) matrix with Q[action_pursuer, action_evader]."""
     nA = len(actions)
@@ -273,6 +275,7 @@ def qtensor_by_state(learner, actions):
                 M[a1, a2] = qdict.get((a1, a2), 0.0)
         out[s] = M
     return out
+
 
 def save_q_and_report(pursuer_learner, evader_learner, actions, outdir="stat", tol=1e-5):
     os.makedirs(outdir, exist_ok=True)
@@ -325,7 +328,8 @@ if __name__ == "__main__":
     actions = list(range(4))  # up, down, left, right
 
     # --- training loop ---
-    num_episodes = 30000
+    #num_episodes = 30000
+    num_episodes = 1
     init_eps = 0.3
     init_alpha = 0.2
     gamma = 1
