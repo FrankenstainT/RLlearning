@@ -110,7 +110,7 @@ class PursuitEvasionParallelEnv(ParallelEnv):
             # distance shaping: normalized to [0, 0.1] per step
             distance_delta = (abs(cur_e[0] - cur_p[0]) + abs(cur_e[1] - cur_p[1])) - (abs(py - ey) + abs(px - ex))
             ev_distance_delta = abs(cur_e[0] - self.safe_zone[0]) + abs(cur_e[1] - self.safe_zone[1]) - (
-                        abs(ey - self.safe_zone[0]) + abs(ex - self.safe_zone[1]))
+                    abs(ey - self.safe_zone[0]) + abs(ex - self.safe_zone[1]))
             shaping = distance_delta - self.safe_zone_distance_factor * ev_distance_delta
             # print(f"shaping: {1 - distance / max_distance} {.1 * ev_distance / max_distance}")
             rewards["pursuer"] = shaping
@@ -184,6 +184,10 @@ class PursuitEvasionParallelEnv(ParallelEnv):
             obs[agent] = np.concatenate([flat, pos_vec])
         return obs
 
+    def state_key(self):
+        # Canonical, agent-agnostic world state key
+        return f"P{tuple(self.pos['pursuer'])}|E{tuple(self.pos['evader'])}|S{self.safe_zone}|O{sorted(self.obstacles)}"
+
 
 def save_episode_animation(episode, save_dir="renders", fps=2):
     """Combine saved frames of one episode into a GIF"""
@@ -218,6 +222,7 @@ class EpsGreedyPolicy:
         If deterministic=True -> return argmax(pi_probs) (pure).
         If deterministic=False -> sample from pi_probs (stochastic evaluation).
     """
+
     def __init__(self, epsilon=0.1):
         self.epsilon = float(epsilon)
 
@@ -256,6 +261,62 @@ class EpsGreedyPolicy:
             return int(np.argmax(p))
         else:
             return int(np.random.choice(len(p), p=p))
+
+def qtensor_by_state(learner, actions):
+    """Return dict: state_key -> (nA x nA) matrix with Q[action_pursuer, action_evader]."""
+    nA = len(actions)
+    out = {}
+    for s, qdict in learner.q.items():
+        M = np.zeros((nA, nA), dtype=float)
+        for a1 in actions:
+            for a2 in actions:
+                M[a1, a2] = qdict.get((a1, a2), 0.0)
+        out[s] = M
+    return out
+
+def save_q_and_report(pursuer_learner, evader_learner, actions, outdir="stat", tol=1e-5):
+    os.makedirs(outdir, exist_ok=True)
+    pQ = qtensor_by_state(pursuer_learner, actions)
+    eQ = qtensor_by_state(evader_learner, actions)
+
+    # Save raw Q-tables (pickle)
+    with open(os.path.join(outdir, "q_tables.pkl"), "wb") as f:
+        pickle.dump({"pursuer": pQ, "evader": eQ}, f)
+
+    # Compare: for states present in either learner
+    all_states = sorted(set(pQ.keys()) | set(eQ.keys()))
+    diffs = []
+    missing_in_p, missing_in_e = [], []
+    for s in all_states:
+        if s not in pQ:
+            missing_in_p.append(s)
+            continue
+        if s not in eQ:
+            missing_in_e.append(s)
+            continue
+        D = pQ[s] + eQ[s]  # should be ~ zero matrix
+        diffs.append((s, float(np.max(np.abs(D))), float(np.mean(np.abs(D)))))
+
+    diffs.sort(key=lambda t: t[1], reverse=True)
+    report_path = os.path.join(outdir, "q_antisymmetry_report.txt")
+    with open(report_path, "w") as f:
+        f.write("Q antisymmetry check: expecting Q_pursuer(s,a1,a2) = - Q_evader(s,a1,a2)\n")
+        f.write(f"Total comparable states: {len(diffs)}\n")
+        if diffs:
+            worst = diffs[0]
+            f.write(f"Worst state max|Qp+Qe| = {worst[1]:.6g}, mean|Qp+Qe| = {worst[2]:.6g}, state = {worst[0]}\n")
+            num_ok = sum(d[1] <= tol for d in diffs)
+            f.write(f"States within tol ({tol}): {num_ok}/{len(diffs)}\n")
+            f.write("\nTop 10 worst states:\n")
+            for s, mx, mn in diffs[:10]:
+                f.write(f"  max={mx:.6g}, mean={mn:.6g}, state={s}\n")
+        if missing_in_p:
+            f.write(f"\nStates missing in pursuer table: {len(missing_in_p)}\n")
+        if missing_in_e:
+            f.write(f"States missing in evader table: {len(missing_in_e)}\n")
+    print(f"Saved Q tables and antisymmetry report to {report_path}")
+
+
 if __name__ == "__main__":
     # --- environment ---
     env = PursuitEvasionParallelEnv(grid_size=5, max_steps=10, obstacles=[(0, 2), (1, 1)])
@@ -301,18 +362,28 @@ if __name__ == "__main__":
         avg_rewards = {"pursuer": 0, "evader": 0}
         step = 0
         if (ep + 1) % 100 == 0:
+            # use a canonical, agent-agnostic state key
+            state_str = env.state_key()  # <- add env.state_key() as shown earlier
+
+            # make sure both learners have this state initialized
+            pursuer_learner.check_new_state(state_str)
+            evader_learner.check_new_state(state_str)
+
             env.render(episode=ep, step=step, live=False)
+
             log_file.write(
-                f"ep{ep} pi pursuer {pursuer_learner.pi[str(obs['pursuer'])]}, "
-                f"evader {evader_learner.pi[str(obs['evader'])]}\n"
+                f"ep{ep} pi pursuer {pursuer_learner.pi[state_str]}, "
+                f"evader {evader_learner.pi[state_str]}\n"
             )
             print(
-                f"ep{ep} pi pursuer {pursuer_learner.pi[str(obs['pursuer'])]}, evader {evader_learner.pi[str(obs['evader'])]}")
+                f"ep{ep} pi pursuer {pursuer_learner.pi[state_str]}, "
+                f"evader {evader_learner.pi[state_str]}"
+            )
         while env.agents:
             # get actions from learners
             actions_dict = {}
             for agent in env.agents:
-                state_str = str(obs[agent])  # tabular state: stringify observation
+                state_str = env.state_key()
                 learners[agent].state = state_str
                 learners[agent].check_new_state(state_str)
                 actions_dict[agent] = learners[agent].act(training=True)
@@ -326,7 +397,7 @@ if __name__ == "__main__":
 
             # let learners observe and learn
             for agent in env.agents:
-                next_state_str = str(next_obs[agent])
+                next_state_str = env.state_key()
                 learners[agent].observe(
                     state=next_state_str,
                     reward=rewards[agent],
@@ -367,6 +438,7 @@ if __name__ == "__main__":
         print(
             f"Episode {ep} finished in {step} steps. Avg rewards: Pursurer {avg_rewards['pursuer']:.4g}; Evader {avg_rewards['evader']:.4g}")
     log_file.close()
+    save_q_and_report(pursuer_learner, evader_learner, actions, outdir="stat", tol=1e-5)
 
     plt.figure()
     plt.plot(episode_lengths)
@@ -430,7 +502,7 @@ if __name__ == "__main__":
         while True:
             actions_dict = {}
             for agent in env.agents:
-                state_str = str(obs[agent])
+                state_str = env.state_key()
                 learners[agent].state = state_str
                 # make sure the state exists in learned policy
                 if state_str not in learners[agent].pi:
