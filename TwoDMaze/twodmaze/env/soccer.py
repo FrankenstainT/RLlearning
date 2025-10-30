@@ -304,30 +304,36 @@ class NashQLearner:
     """
     Single Q for A’s payoff. At each state, build a 5x5 matrix from Q[s],
     solve (x,y,v) with one LP, TD-update Q(s,aA,aB) toward r + γ V(s').
-    Per (s,a) visitation-decayed step-size for stability.
+    Per-(s,aA,aB) **count-based Robbins–Monro step-size**:
+        α_t(s,a) = α0 / (1 + N_t(s,a))^p,  with 0.5 < p ≤ 1
     """
-    def __init__(self, gamma=0.9, alpha0=0.5, alpha_power=0.6, eps_init=0.3, eps_final=0.02, episodes=50000):
+    def __init__(self, gamma=0.9, alpha0=0.5, alpha_power=0.6,
+                 eps_init=0.3, eps_final=0.02, episodes=50000):
         self.gamma = float(gamma)
+        # Robbins–Monro base and exponent (p in (0.5, 1] ensures ∑α=∞, ∑α^2<∞)
         self.alpha0 = float(alpha0)
         self.alpha_power = float(alpha_power)
+
         self.epsA = EpsGreedy(eps_init)
         self.epsB = EpsGreedy(eps_init)
-        self.eps_decay = (eps_final / eps_init) ** (1.0 / max(1, episodes))
+        # smooth epsilon schedule (will multiply each episode)
+        self.eps_decay = .995#(max(eps_final, 1e-6) / max(eps_init, 1e-6)) ** (1.0 / max(1, episodes))
 
         self.Q: Dict[State, Dict[Tuple[int,int], float]] = {}
         self.V: Dict[State, float] = {}
         self.PiA: Dict[State, np.ndarray] = {}
         self.PiB: Dict[State, np.ndarray] = {}
+        # visitation counts N(s,(aA,aB)) driving Robbins–Monro α_t
         self.vis: Dict[State, Dict[Tuple[int,int], int]] = {}
-        self.dirty: set[State] = set()
+        self.dirty: set = set()
 
-        self.state: State | None = None
-        self.last_pair: Tuple[int, int] | None = None
+        self.state: State = None  # type: ignore
+        self.last_pair: Tuple[int, int] = None  # type: ignore
 
         self.episode_deltas: List[float] = []
         self._ep_max_delta = 0.0
 
-        # for clipping bound (safe given reward in [-1,1])
+        # safe clipping bound (reward ∈ [-1,1]) ⇒ |Q| ≤ 1/(1-γ)
         self.q_clip = 1.0 / max(1e-6, (1.0 - self.gamma))
 
     def _ensure(self, s: State):
@@ -368,44 +374,52 @@ class NashQLearner:
 
     def act(self) -> Tuple[int, int]:
         s = self.state
-        x, y, _ = self._solve(s)  # type: ignore
+        x, y, _ = self._solve(s)  # ensure policies are up-to-date
         aA = self.epsA.pick(x)
         aB = self.epsB.pick(y)
         self.last_pair = (aA, aB)
         return aA, aB
 
+    # -------- Robbins–Monro step size (count-based) --------
     def _alpha(self, s: State, aA: int, aB: int) -> float:
+        """
+        α_t(s,a) = α0 / (1 + N_t(s,a))^p
+        - Ensures diminishing steps with persistent exploration.
+        - Choose 0.5 < p ≤ 1 for standard convergence conditions.
+        """
         n = self.vis[s][(aA, aB)]
         return self.alpha0 / ((1.0 + n) ** self.alpha_power)
 
     def observe(self, s_next: State, reward: float, done: bool):
-        s = self.state  # type: ignore
-        aA, aB = self.last_pair  # type: ignore
+        s = self.state
+        aA, aB = self.last_pair
         self._ensure(s); self._ensure(s_next)
 
-        # make sure V(s_next) is consistent with its current Q
+        # update V(s_next) from current Q(s_next,·,·)
         self._solve(s_next)
 
         target = reward + (0.0 if done else self.gamma * self.V[s_next])
-        old = self.Q[s][(aA, aB)]
-        a = self._alpha(s, aA, aB)
-        new = old + a * (target - old)
+        old_q = self.Q[s][(aA, aB)]
+        alpha = self._alpha(s, aA, aB)
+        new_q = old_q + alpha * (target - old_q)
 
-        # ----- Q CLIPPING (prevents numeric blow-up) -----
-        clip_bound = self.q_clip  # R_max=1 -> 1/(1-gamma)
-        new = float(np.clip(new, -clip_bound, clip_bound))
+        # clip for numeric stability
+        bound = self.q_clip
+        new_q = float(np.clip(new_q, -bound, bound))
 
-        self.Q[s][(aA, aB)] = new
+        # commit update
+        self.Q[s][(aA, aB)] = new_q
         self.vis[s][(aA, aB)] += 1
-        self._ep_max_delta = max(self._ep_max_delta, abs(new - old))
+        self._ep_max_delta = max(self._ep_max_delta, abs(new_q - old_q))
 
-        self.dirty.add(s)   # policy at s changed
+        # mark policy at s dirty (matrix changed), advance state
+        self.dirty.add(s)
         self.state = s_next
 
     def end_episode(self):
         self.episode_deltas.append(self._ep_max_delta)
         self._ep_max_delta = 0.0
-        # decay eps
+        # smooth epsilon anneal
         self.epsA.eps = max(self.epsA.eps * self.eps_decay, 0.02)
         self.epsB.eps = max(self.epsB.eps * self.eps_decay, 0.02)
 
@@ -529,11 +543,11 @@ def main():
         f.write(f"pi_A*(B-ball) over {ACTIONS} = {np.round(PiA_star[sB], 6)}\n")
         f.write(f"pi_B*(B-ball) over {ACTIONS} = {np.round(PiB_star[sB], 6)}\n")
 
-    episodes = 100000
+    episodes = 50000
     learner = NashQLearner(
         gamma=env.gamma,
-        alpha0=0.5,
-        alpha_power=0.6,
+        alpha0=0.5,         # Robbins–Monro base step
+        alpha_power=0.6,    # Robbins–Monro exponent p
         eps_init=0.3,
         eps_final=0.02,
         episodes=episodes
