@@ -310,20 +310,17 @@ class NashQLearner:
     def __init__(self, gamma=0.9, alpha0=0.5, alpha_power=0.6,
                  eps_init=0.3, eps_final=0.02, episodes=50000):
         self.gamma = float(gamma)
-        # Robbins–Monro base and exponent (p in (0.5, 1] ensures ∑α=∞, ∑α^2<∞)
         self.alpha0 = float(alpha0)
         self.alpha_power = float(alpha_power)
 
         self.epsA = EpsGreedy(eps_init)
         self.epsB = EpsGreedy(eps_init)
-        # smooth epsilon schedule (will multiply each episode)
-        self.eps_decay = .995#(max(eps_final, 1e-6) / max(eps_init, 1e-6)) ** (1.0 / max(1, episodes))
+        self.eps_decay = (max(eps_final, 1e-6) / max(eps_init, 1e-6)) ** (1.0 / max(1, episodes))
 
         self.Q: Dict[State, Dict[Tuple[int,int], float]] = {}
         self.V: Dict[State, float] = {}
         self.PiA: Dict[State, np.ndarray] = {}
         self.PiB: Dict[State, np.ndarray] = {}
-        # visitation counts N(s,(aA,aB)) driving Robbins–Monro α_t
         self.vis: Dict[State, Dict[Tuple[int,int], int]] = {}
         self.dirty: set = set()
 
@@ -333,7 +330,6 @@ class NashQLearner:
         self.episode_deltas: List[float] = []
         self._ep_max_delta = 0.0
 
-        # safe clipping bound (reward ∈ [-1,1]) ⇒ |Q| ≤ 1/(1-γ)
         self.q_clip = 1.0 / max(1e-6, (1.0 - self.gamma))
 
     def _ensure(self, s: State):
@@ -360,7 +356,6 @@ class NashQLearner:
             try:
                 x, y, v = solve_both_policies_one_lp(M)
             except Exception:
-                # sanitize + stronger jitter retry
                 M = np.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
                 x, y, v = solve_both_policies_one_lp(M, jitter=1e-6, max_retries=3)
             self.PiA[s], self.PiB[s], self.V[s] = x, y, v
@@ -374,19 +369,13 @@ class NashQLearner:
 
     def act(self) -> Tuple[int, int]:
         s = self.state
-        x, y, _ = self._solve(s)  # ensure policies are up-to-date
+        x, y, _ = self._solve(s)
         aA = self.epsA.pick(x)
         aB = self.epsB.pick(y)
         self.last_pair = (aA, aB)
         return aA, aB
 
-    # -------- Robbins–Monro step size (count-based) --------
     def _alpha(self, s: State, aA: int, aB: int) -> float:
-        """
-        α_t(s,a) = α0 / (1 + N_t(s,a))^p
-        - Ensures diminishing steps with persistent exploration.
-        - Choose 0.5 < p ≤ 1 for standard convergence conditions.
-        """
         n = self.vis[s][(aA, aB)]
         return self.alpha0 / ((1.0 + n) ** self.alpha_power)
 
@@ -395,7 +384,6 @@ class NashQLearner:
         aA, aB = self.last_pair
         self._ensure(s); self._ensure(s_next)
 
-        # update V(s_next) from current Q(s_next,·,·)
         self._solve(s_next)
 
         target = reward + (0.0 if done else self.gamma * self.V[s_next])
@@ -403,23 +391,19 @@ class NashQLearner:
         alpha = self._alpha(s, aA, aB)
         new_q = old_q + alpha * (target - old_q)
 
-        # clip for numeric stability
         bound = self.q_clip
         new_q = float(np.clip(new_q, -bound, bound))
 
-        # commit update
         self.Q[s][(aA, aB)] = new_q
         self.vis[s][(aA, aB)] += 1
         self._ep_max_delta = max(self._ep_max_delta, abs(new_q - old_q))
 
-        # mark policy at s dirty (matrix changed), advance state
         self.dirty.add(s)
         self.state = s_next
 
     def end_episode(self):
         self.episode_deltas.append(self._ep_max_delta)
         self._ep_max_delta = 0.0
-        # smooth epsilon anneal
         self.epsA.eps = max(self.epsA.eps * self.eps_decay, 0.02)
         self.epsB.eps = max(self.epsB.eps * self.eps_decay, 0.02)
 
@@ -464,29 +448,20 @@ def save_q_tables_pickle(learner: NashQLearner, outpath: str):
         pickle.dump(mats, f)
 
 def draw_frame(env: MarkovSoccer, s: State, step_idx: int, out_dir: str):
-    """
-    Draw a single frame PNG showing grid, both agents, and a ball (circle)
-    at the current owner (A if ball=0, B if ball=1).
-    Also shade goals (FIXED: B-left, A-right).
-    """
     ensure_dir(out_dir)
     fig, ax = plt.subplots(figsize=(6, 5))
 
-    # grid
     for y in range(env.H + 1):
         ax.plot([-0.5, env.W - 0.5], [y - 0.5, y - 0.5], linewidth=0.5, color="gray")
     for x in range(env.W + 1):
         ax.plot([x - 0.5, x - 0.5], [-0.5, env.H - 0.5], linewidth=0.5, color="gray")
 
-    # goals (left = B's goal, right = A's goal)
     ax.fill_betweenx([-0.5, env.H - 0.5], -1.0, -0.5, alpha=0.12, color="purple", label="B Goal (left)")
     ax.fill_betweenx([-0.5, env.H - 0.5], env.W - 0.5, env.W, alpha=0.12, color="green", label="A Goal (right)")
 
-    # agents
     ax.plot([s.Ax], [s.Ay], marker='o', markersize=12, linestyle='None', label='A', color="tab:blue")
     ax.plot([s.Bx], [s.By], marker='s', markersize=12, linestyle='None', label='B', color="tab:red")
 
-    # ball as a circle at owner's position
     by, bx = (s.Ay, s.Ax) if s.ball == 0 else (s.By, s.Bx)
     circ = plt.Circle((bx, by), radius=0.2, fill=False, linewidth=2.5, color="black")
     ax.add_patch(circ)
@@ -503,16 +478,13 @@ def draw_frame(env: MarkovSoccer, s: State, step_idx: int, out_dir: str):
     return fname
 
 def frames_to_gif_mp4(frames_dir: str, out_gif: str, out_mp4: str, fps: int = 3):
-    # collect all frames
     files = sorted([os.path.join(frames_dir, f) for f in os.listdir(frames_dir)
                     if f.lower().endswith(".png")])
     if not files:
         print(f"No frames in {frames_dir}")
         return
     imgs = [imageio.imread(f) for f in files]
-    # GIF
     imageio.mimsave(out_gif, imgs, duration=1.0 / fps, loop=0, subrectangles=False)
-    # MP4
     imageio.mimsave(out_mp4, imgs, fps=fps, macro_block_size=None)
     print(f"Saved video: {out_gif}")
     print(f"Saved video: {out_mp4}")
@@ -532,7 +504,6 @@ def main():
 
     print("Computing ground-truth Nash via Shapley value iteration...")
     V_star, PiA_star, PiB_star = shapley_value_iteration(env, tol=1e-10, max_iter=2000)
-    # record both start-ball cases for reference
     sA = State(2,1,1,3,0)
     sB = State(2,1,1,3,1)
     with open(os.path.join(outdir, "ground_truth_starts.txt"), "w") as f:
@@ -546,8 +517,8 @@ def main():
     episodes = 50000
     learner = NashQLearner(
         gamma=env.gamma,
-        alpha0=0.5,         # Robbins–Monro base step
-        alpha_power=0.6,    # Robbins–Monro exponent p
+        alpha0=0.5,
+        alpha_power=0.6,
         eps_init=0.3,
         eps_final=0.02,
         episodes=episodes
@@ -560,14 +531,14 @@ def main():
     eval_points, eval_max_eps, eval_mean_eps = [], [], []
 
     for ep in range(episodes):
-        s = env.sample_start()  # random initial possession
+        s = env.sample_start()
         learner.start(s)
         G = 0.0
         t = 0
         while True:
             aA_idx, aB_idx = learner.act()
             aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
-            ns, r, done = env.step_det_random(s, aA, aB)  # stochastic order
+            ns, r, done = env.step_det_random(s, aA, aB)
             G += (env.gamma ** t) * r
             learner.observe(ns, r, done)
             s = ns
@@ -591,12 +562,10 @@ def main():
             print(f"Episode {ep+1}: avg discounted return (last block) = {np.mean(last):.4f}, "
                   f"ΔQ_max_last={learner.episode_deltas[-1]:.3e}, eps≈{learner.epsA.eps:.3f}")
 
-    # ---------------------- SAVE Q TABLES ----------------------
     qpath = os.path.join(outdir, "nash_q_tables.pkl")
     save_q_tables_pickle(learner, qpath)
     print(f"Saved Nash-Q tables to {qpath}")
 
-    # ---------------------- PLOTS & STATS ----------------------
     plot_and_save(range(1, len(episode_lengths) + 1), episode_lengths,
                   "Episode Lengths", "Episode", "Steps",
                   os.path.join(outdir, "episode_lengths.png"))
@@ -627,30 +596,37 @@ def main():
                       os.path.join(outdir, "exploitability_mean.png"))
 
     # ============================================================
-    #                FINAL GREEDY EVALUATION (VIDEO)
+    #        FINAL GREEDY EVALUATION (NO EPSILON; MIXED POLICIES)
     # ============================================================
     print("\n=== Final Greedy Evaluation (sampling from learned mixed policies) ===")
     np.random.seed(1234)
-    s = env.sample_start()  # random possession at eval too
-    learner._ensure(s); learner._solve(s)
+    s = env.sample_start()
+
+    # Helper: always ensure we have policies for the current state
+    def ensure_policy(state: State):
+        learner._ensure(state)
+        learner._solve(state)
+        return learner.PiA[state], learner.PiB[state]
+
+    # ensure for initial state
+    ensure_policy(s)
 
     frames_dir = os.path.join(outdir, "greedy_frames")
     ensure_dir(frames_dir)
     step = 0
-    draw_frame(env, s, step, frames_dir)  # initial frame
+    draw_frame(env, s, step, frames_dir)
 
     while True:
-        x = learner.PiA[s]
-        y = learner.PiB[s]
-        # "Greedy" here = sample from learned mixed policy (no epsilon exploration)
-        aA_idx = EpsGreedy(0).sample(x)
+        x, y = ensure_policy(s)                 # <-- ensure policies exist
+        aA_idx = EpsGreedy(0).sample(x)         # sample from learned mixed policy (no ε)
         aB_idx = EpsGreedy(0).sample(y)
         aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
 
         ns, r, done = env.step_det_random(s, aA, aB)
         step += 1
         draw_frame(env, ns, step, frames_dir)
-        s = ns
+
+        s = ns                                   # advance
         if done or step > 200:
             break
 
