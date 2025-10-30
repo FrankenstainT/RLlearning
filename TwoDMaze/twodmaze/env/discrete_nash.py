@@ -252,86 +252,177 @@ class EpsGreedyPolicy:
 # ============================================================
 #                ONE-LP SOLVER FOR BOTH POLICIES
 # ============================================================
-def solve_both_policies_one_lp(M):
-    """
-    Solve both players' optimal mixed strategies from a single LP:
-        maximize v
-        s.t.   v <= x^T M[:,j]   for all j
-               M[i,:] y <= v      for all i
-               1^T x = 1, x >= 0
-               1^T y = 1, y >= 0
-    We minimize -v via SciPy HiGHS.
-    Returns x, y, v.
-    """
-    M = np.asarray(M, dtype=float)
-    m, n = M.shape
+import numpy as np
+from scipy.optimize import linprog
+import os, json
 
-    # Decision vector z = [x(0..m-1), y(0..n-1), v]
+def _sanitize_and_scale(M):
+    M = np.array(M, dtype=float)
+    # Replace non-finite with 0 (rare, but fatal to HiGHS)
+    M[~np.isfinite(M)] = 0.0
+    # Center & scale to tame magnitudes (policies invariant to shift/scale)
+    c = float(np.median(M))               # shift by median (robust)
+    M0 = M - c
+    k = float(np.max(np.abs(M0))) or 1.0  # avoid divide by zero
+    M1 = M0 / k
+    return M1, c, k
+
+def _one_lp_core(M, slack=1e-9, options=None):
+    M = np.asarray(M, float)
+    m, n = M.shape
     num_vars = m + n + 1
     x_slice = slice(0, m)
     y_slice = slice(m, m + n)
-    v_idx = m + n
+    v_idx   = m + n
 
-    # Objective: minimize -v (equivalently, maximize v)
-    c = np.zeros(num_vars)
-    c[v_idx] = -1.0
+    c_obj = np.zeros(num_vars)
+    c_obj[v_idx] = -1.0  # maximize v
 
-    # Inequalities: A_ub z <= b_ub
-    A_ub, b_ub = [], []
+    A_ub = []
+    b_ub = []
 
-    # 1) v <= x^T M[:,j] -> -M[:,j]^T x + v <= 0
+    # v <= x^T M[:,j] + slack
     for j in range(n):
         row = np.zeros(num_vars)
         row[x_slice] = -M[:, j]
-        row[v_idx] = 1.0
-        A_ub.append(row)
-        b_ub.append(0.0)
+        row[v_idx]   =  1.0
+        A_ub.append(row); b_ub.append(slack)
 
-    # 2) M[i,:] y <= v -> M[i,:] y - v <= 0
+    # M[i,:] y <= v + slack
     for i in range(m):
         row = np.zeros(num_vars)
         row[y_slice] = M[i, :]
-        row[v_idx] = -1.0
-        A_ub.append(row)
-        b_ub.append(0.0)
+        row[v_idx]   = -1.0
+        A_ub.append(row); b_ub.append(slack)
 
-    A_ub = np.vstack(A_ub) if A_ub else None
-    b_ub = np.array(b_ub) if b_ub else None
+    A_ub = np.vstack(A_ub)
+    b_ub = np.array(b_ub)
 
-    # Equalities: 1^T x = 1, 1^T y = 1
     A_eq = np.zeros((2, num_vars))
     b_eq = np.array([1.0, 1.0])
     A_eq[0, x_slice] = 1.0
     A_eq[1, y_slice] = 1.0
 
-    # Bounds: x>=0, y>=0, v free
-    bounds = [(0, None)] * m + [(0, None)] * n + [(None, None)]
+    bounds = [(0, None)] * m + [(0, None)] * n + [(None, None)]  # v free
 
-    res = linprog(
-        c, A_ub=A_ub, b_ub=b_ub,
-        A_eq=A_eq, b_eq=b_eq,
-        bounds=bounds, method="highs"
-    )
-    if res.status != 0:
-        raise RuntimeError(f"LP failed: {res.message}")
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub,
+                  A_eq=A_eq, b_eq=b_eq,
+                  bounds=bounds, method="highs",
+                  options=(options or {"presolve": True}))
+    return res
 
-    z = res.x
-    x = z[x_slice].clip(min=0)
-    y = z[y_slice].clip(min=0)
-    v = z[v_idx]
+def _two_lp_fallback(M):
+    """Solve row player's maxmin and column player's minmax with two LPs."""
+    M = np.asarray(M, float)
+    m, n = M.shape
 
-    # Normalize (robust to numerical drift)
-    sx, sy = x.sum(), y.sum()
-    if sx > 0:
-        x /= sx
-    else:
-        x = np.ones(m) / m
-    if sy > 0:
-        y /= sy
-    else:
-        y = np.ones(n) / n
+    # Row player (x): maximize t s.t. M^T x >= t*1, 1^T x=1, x>=0
+    # Convert to minimize -t
+    num_vars_x = m + 1
+    t_idx = m
+    c_x = np.zeros(num_vars_x); c_x[t_idx] = -1.0
 
+    A_ub_x = []
+    b_ub_x = []
+    # -M^T x + t*1 <= 0
+    for j in range(n):
+        row = np.zeros(num_vars_x)
+        row[:m] = -M[:, j]
+        row[t_idx] = 1.0
+        A_ub_x.append(row); b_ub_x.append(0.0)
+
+    A_eq_x = np.zeros((1, num_vars_x)); A_eq_x[0, :m] = 1.0
+    b_eq_x = np.array([1.0])
+    bounds_x = [(0, None)] * m + [(None, None)]
+    res_x = linprog(c_x, A_ub=np.vstack(A_ub_x), b_ub=np.array(b_ub_x),
+                    A_eq=A_eq_x, b_eq=b_eq_x, bounds=bounds_x, method="highs")
+    if res_x.status != 0:
+        raise RuntimeError(f"Row LP failed: {res_x.message}")
+    x = res_x.x[:m].clip(min=0)
+    x_sum = x.sum(); x = x/x_sum if x_sum > 0 else np.ones(m)/m
+    v1 = res_x.x[t_idx]
+
+    # Column player (y): minimize s.t. M y <= s*1, 1^T y=1, y>=0
+    num_vars_y = n + 1
+    s_idx = n
+    c_y = np.zeros(num_vars_y); c_y[s_idx] = 1.0
+
+    A_ub_y = []
+    b_ub_y = []
+    # M y - s*1 <= 0
+    for i in range(m):
+        row = np.zeros(num_vars_y)
+        row[:n] = M[i, :]
+        row[s_idx] = -1.0
+        A_ub_y.append(row); b_ub_y.append(0.0)
+
+    A_eq_y = np.zeros((1, num_vars_y)); A_eq_y[0, :n] = 1.0
+    b_eq_y = np.array([1.0])
+    bounds_y = [(0, None)] * n + [(None, None)]
+    res_y = linprog(c_y, A_ub=np.vstack(A_ub_y), b_ub=np.array(b_ub_y),
+                    A_eq=A_eq_y, b_eq=b_eq_y, bounds=bounds_y, method="highs")
+    if res_y.status != 0:
+        raise RuntimeError(f"Column LP failed: {res_y.message}")
+    y = res_y.x[:n].clip(min=0)
+    y_sum = y.sum(); y = y/y_sum if y_sum > 0 else np.ones(n)/n
+    v2 = res_y.x[s_idx]
+
+    # In exact zero-sum, v1 ≈ v2. Return their average for robustness.
+    v = 0.5 * (v1 + v2)
     return x, y, v
+
+def solve_both_policies_one_lp(M, log_dir="stat", state_key_for_log=None):
+    """
+    Robust solver: sanitize+scale, try one-LP with slack and jitter, then two-LP fallback.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+
+    M1, c_shift, k_scale = _sanitize_and_scale(M)
+
+    # 1) main attempt
+    res = _one_lp_core(M1, slack=1e-9)
+    if res.status == 0:
+        z = res.x
+        m, n = M1.shape
+        x = z[:m].clip(min=0); y = z[m:m+n].clip(min=0); v = z[m+n]
+        sx, sy = x.sum(), y.sum()
+        x = x/sx if sx > 0 else np.ones(m)/m
+        y = y/sy if sy > 0 else np.ones(n)/n
+        v_real = k_scale * v + c_shift
+        return x, y, v_real
+
+    # 2) retry with tiny jitter (breaks degeneracy)
+    rng = np.random.default_rng(0)
+    Mj = M1 + 1e-10 * rng.standard_normal(M1.shape)
+    res2 = _one_lp_core(Mj, slack=1e-9)
+    if res2.status == 0:
+        z = res2.x
+        m, n = M1.shape
+        x = z[:m].clip(min=0); y = z[m:m+n].clip(min=0); v = z[m+n]
+        sx, sy = x.sum(), y.sum()
+        x = x/sx if sx > 0 else np.ones(m)/m
+        y = y/sy if sy > 0 else np.ones(n)/n
+        v_real = k_scale * v + c_shift
+        return x, y, v_real
+
+    # 3) log and fallback to two-LP
+    try:
+        payload = {
+            "state": state_key_for_log,
+            "status1": int(res.status) if res is not None else None,
+            "message1": getattr(res, "message", None),
+            "status2": int(res2.status) if res2 is not None else None,
+            "message2": getattr(res2, "message", None),
+            "M_preview": np.round(np.asarray(M, float), 6).tolist(),
+        }
+        with open(os.path.join(log_dir, "lp_fail_debug.jsonl"), "a") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
+
+    x, y, v_scaled = _two_lp_fallback(M1)
+    v_real = k_scale * v_scaled + c_shift
+    return x, y, v_real
 
 
 # ============================================================
@@ -384,7 +475,9 @@ class NashQLearner:
         self._ensure_state(s)
         if (s in self.policy_dirty) or force:
             M = self._matrix_from_Q(s)
-            x, y, v = solve_both_policies_one_lp(M)
+            x, y, v = solve_both_policies_one_lp(M,
+                                                 log_dir="stat",
+                                                 state_key_for_log=s)
             self.pi_x[s], self.pi_y[s], self.V[s] = x, y, v
             self.policy_dirty.discard(s)
         return self.pi_x[s], self.pi_y[s], self.V[s]
@@ -492,7 +585,11 @@ def nash_report(nash_learner, actions, tol=1e-4, outdir="stat"):
             for ae in actions:
                 M[ap, ae] = nash_learner.Q[s][(ap, ae)]
         # policies & value implied by current Q
-        x, y, v = solve_both_policies_one_lp(M)
+        # inside NashQLearner._solve_policies(self, s):
+        x, y, v = solve_both_policies_one_lp(M,
+                                             log_dir="stat",
+                                             state_key_for_log=s)
+
         eps, row_gain, col_gain = state_exploitability(M, x, y, v)
         eps_list.append(eps)
         if eps > worst[0]:
