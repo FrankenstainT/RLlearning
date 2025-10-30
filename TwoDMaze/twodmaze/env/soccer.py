@@ -17,8 +17,10 @@ import imageio.v2 as imageio
 ACTIONS = ["N", "S", "W", "E", "Stay"]
 DIR = {"N": (-1, 0), "S": (1, 0), "W": (0, -1), "E": (0, 1), "Stay": (0, 0)}
 
+
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
 
 def plot_and_save(xs, ys, title, xlabel, ylabel, outpath):
     plt.figure()
@@ -30,12 +32,14 @@ def plot_and_save(xs, ys, title, xlabel, ylabel, outpath):
     plt.savefig(outpath)
     plt.close()
 
+
 def moving_average(arr, win=100):
     arr = np.asarray(arr, float)
     if len(arr) < win:
         return arr.copy()
-    kernel = np.ones(win)/win
+    kernel = np.ones(win) / win
     return np.convolve(arr, kernel, mode="valid")
+
 
 # ============================================================
 #                  ENV: MARKOV SOCCER (Sequential moves)
@@ -49,6 +53,7 @@ class State:
     Bx: int
     ball: int  # 0 if A has ball, 1 if B has ball
 
+
 class MarkovSoccer:
     """
     4x5 grid; **A scores on the right, B scores on the left**. Zero-sum.
@@ -56,6 +61,7 @@ class MarkovSoccer:
     eliminating same-cell states and matching the canonical Markov Soccer setup.
     Reward +1 for A scoring, -1 for B scoring; discount gamma.
     """
+
     def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0):
         self.H, self.W = H, W
         self.gamma = float(gamma)
@@ -162,6 +168,7 @@ class MarkovSoccer:
         return State(self._start_no_ball.Ay, self._start_no_ball.Ax,
                      self._start_no_ball.By, self._start_no_ball.Bx, ball)
 
+
 # ============================================================
 #     ROBUST ONE-LP SADDLE SOLVER (NUMERICALLY STABLE)
 # ============================================================
@@ -195,27 +202,36 @@ def solve_both_policies_one_lp(M: np.ndarray, jitter=1e-8, max_retries=2):
     def _solve_raw(A):
         m, n = A.shape
         num = m + n + 1
-        xs = slice(0, m); ys = slice(m, m + n); vidx = m + n
+        xs = slice(0, m);
+        ys = slice(m, m + n);
+        vidx = m + n
 
-        c = np.zeros(num); c[vidx] = -1.0
-        A_ub = []; b_ub = []
+        c = np.zeros(num);
+        c[vidx] = -1.0
+        A_ub = [];
+        b_ub = []
 
         # v <= x^T A[:,j]
         for j in range(n):
             row = np.zeros(num)
             row[xs] = -A[:, j]
             row[vidx] = 1.0
-            A_ub.append(row); b_ub.append(0.0)
+            A_ub.append(row);
+            b_ub.append(0.0)
 
         # A[i,:] y <= v
         for i in range(m):
             row = np.zeros(num)
             row[ys] = A[i, :]
             row[vidx] = -1.0
-            A_ub.append(row); b_ub.append(0.0)
+            A_ub.append(row);
+            b_ub.append(0.0)
 
-        A_ub = np.vstack(A_ub); b_ub = np.array(b_ub)
-        A_eq = np.zeros((2, num)); A_eq[0, xs] = 1.0; A_eq[1, ys] = 1.0
+        A_ub = np.vstack(A_ub);
+        b_ub = np.array(b_ub)
+        A_eq = np.zeros((2, num));
+        A_eq[0, xs] = 1.0;
+        A_eq[1, ys] = 1.0
         b_eq = np.array([1.0, 1.0])
         bounds = [(0, None)] * m + [(0, None)] * n + [(None, None)]
 
@@ -231,7 +247,9 @@ def solve_both_policies_one_lp(M: np.ndarray, jitter=1e-8, max_retries=2):
         if res.status == 0 and np.isfinite(res.fun):
             z = res.x
             m, n = Ms.shape
-            x = np.clip(z[:m], 0, None); y = np.clip(z[m:m+n], 0, None); v = float(z[m+n])
+            x = np.clip(z[:m], 0, None);
+            y = np.clip(z[m:m + n], 0, None);
+            v = float(z[m + n])
             sx, sy = x.sum(), y.sum()
             x = x / sx if sx > 0 else np.ones(m) / m
             y = y / sy if sy > 0 else np.ones(n) / n
@@ -248,6 +266,7 @@ def solve_both_policies_one_lp(M: np.ndarray, jitter=1e-8, max_retries=2):
     v = float(np.mean(M))  # harmless placeholder
     return x, y, v
 
+
 # ============================================================
 #     SHAPLEY VALUE ITERATION (EXPECTATION OVER ORDERS)
 # ============================================================
@@ -256,7 +275,8 @@ def stage_matrix(env: MarkovSoccer, s: State, V: Dict[State, float]) -> np.ndarr
     """
     Expected one-step value under 50/50 AB/BA sequential orders.
     """
-    m = len(ACTIONS); n = len(ACTIONS)
+    m = len(ACTIONS);
+    n = len(ACTIONS)
     M = np.zeros((m, n), float)
     for i, aA in enumerate(ACTIONS):
         for j, aB in enumerate(ACTIONS):
@@ -266,6 +286,7 @@ def stage_matrix(env: MarkovSoccer, s: State, V: Dict[State, float]) -> np.ndarr
             v2 = r2 if d2 else (r2 + env.gamma * V[ns2])
             M[i, j] = 0.5 * (v1 + v2)
     return M
+
 
 def shapley_value_iteration(env: MarkovSoccer, tol: float = 1e-10, max_iter: int = 2000):
     V = {s: 0.0 for s in env.states}
@@ -283,22 +304,30 @@ def shapley_value_iteration(env: MarkovSoccer, tol: float = 1e-10, max_iter: int
             break
     return V, PiA, PiB
 
+
 # ============================================================
 #                   NASH-Q LEARNER
 # ============================================================
 
 class EpsGreedy:
     def __init__(self, eps: float): self.eps = float(eps)
+
     def pick(self, p: np.ndarray) -> int:
-        p = np.asarray(p, float); p = np.clip(p, 0, None); ps = p.sum()
-        p = p/ps if ps > 0 else np.ones_like(p)/len(p)
+        p = np.asarray(p, float);
+        p = np.clip(p, 0, None);
+        ps = p.sum()
+        p = p / ps if ps > 0 else np.ones_like(p) / len(p)
         if np.random.rand() < self.eps:
             return int(np.random.randint(len(p)))
         return int(np.random.choice(len(p), p=p))
+
     def sample(self, p: np.ndarray) -> int:
-        p = np.asarray(p, float); p = np.clip(p, 0, None); ps = p.sum()
-        p = p/ps if ps > 0 else np.ones_like(p)/len(p)
+        p = np.asarray(p, float);
+        p = np.clip(p, 0, None);
+        ps = p.sum()
+        p = p / ps if ps > 0 else np.ones_like(p) / len(p)
         return int(np.random.choice(len(p), p=p))
+
 
 class NashQLearner:
     """
@@ -307,6 +336,7 @@ class NashQLearner:
     Per-(s,aA,aB) **count-based Robbins–Monro step-size**:
         α_t(s,a) = α0 / (1 + N_t(s,a))^p,  with 0.5 < p ≤ 1
     """
+
     def __init__(self, gamma=0.9, alpha0=0.5, alpha_power=0.6,
                  eps_init=0.3, eps_final=0.02, episodes=50000):
         self.gamma = float(gamma)
@@ -317,11 +347,11 @@ class NashQLearner:
         self.epsB = EpsGreedy(eps_init)
         self.eps_decay = (max(eps_final, 1e-6) / max(eps_init, 1e-6)) ** (1.0 / max(1, episodes))
 
-        self.Q: Dict[State, Dict[Tuple[int,int], float]] = {}
+        self.Q: Dict[State, Dict[Tuple[int, int], float]] = {}
         self.V: Dict[State, float] = {}
         self.PiA: Dict[State, np.ndarray] = {}
         self.PiB: Dict[State, np.ndarray] = {}
-        self.vis: Dict[State, Dict[Tuple[int,int], int]] = {}
+        self.vis: Dict[State, Dict[Tuple[int, int], int]] = {}
         self.dirty: set = set()
 
         self.state: State = None  # type: ignore
@@ -382,7 +412,8 @@ class NashQLearner:
     def observe(self, s_next: State, reward: float, done: bool):
         s = self.state
         aA, aB = self.last_pair
-        self._ensure(s); self._ensure(s_next)
+        self._ensure(s);
+        self._ensure(s_next)
 
         self._solve(s_next)
 
@@ -407,6 +438,7 @@ class NashQLearner:
         self.epsA.eps = max(self.epsA.eps * self.eps_decay, 0.02)
         self.epsB.eps = max(self.epsB.eps * self.eps_decay, 0.02)
 
+
 # ============================================================
 #                    EXPLOITABILITY (optional)
 # ============================================================
@@ -418,6 +450,7 @@ def exploitability_for_state(M: np.ndarray, x: np.ndarray, y: np.ndarray, v: flo
     col_gain = float(v - col_vals.min())
     return max(row_gain, col_gain)
 
+
 def evaluate_against_ground_truth(env: MarkovSoccer,
                                   V_star, PiA_star, PiB_star,
                                   PiA_learned, PiB_learned):
@@ -425,10 +458,11 @@ def evaluate_against_ground_truth(env: MarkovSoccer,
     for s in env.states:
         M = stage_matrix(env, s, V_star)
         _, _, v = solve_both_policies_one_lp(M)
-        x = PiA_learned.get(s, np.ones(len(ACTIONS))/len(ACTIONS))
-        y = PiB_learned.get(s, np.ones(len(ACTIONS))/len(ACTIONS))
+        x = PiA_learned.get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
+        y = PiB_learned.get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
         eps.append(exploitability_for_state(M, x, y, v))
     return float(np.max(eps)), float(np.mean(eps))
+
 
 # ============================================================
 #                      SAVE / PLOT HELPERS
@@ -446,6 +480,7 @@ def save_q_tables_pickle(learner: NashQLearner, outpath: str):
         mats[s] = M
     with open(outpath, "wb") as f:
         pickle.dump(mats, f)
+
 
 def draw_frame(env: MarkovSoccer, s: State, step_idx: int, out_dir: str):
     ensure_dir(out_dir)
@@ -467,8 +502,10 @@ def draw_frame(env: MarkovSoccer, s: State, step_idx: int, out_dir: str):
     ax.add_patch(circ)
 
     ax.invert_yaxis()
-    ax.set_xlim([-0.6, env.W - 0.4]); ax.set_ylim([env.H - 0.6, -0.6])
-    ax.set_xticks(range(env.W)); ax.set_yticks(range(env.H))
+    ax.set_xlim([-0.6, env.W - 0.4]);
+    ax.set_ylim([env.H - 0.6, -0.6])
+    ax.set_xticks(range(env.W));
+    ax.set_yticks(range(env.H))
     ax.set_title(f"Greedy Evaluation — Step {step_idx}")
     ax.legend(loc="upper center", ncol=2, fontsize=8)
     plt.tight_layout()
@@ -476,6 +513,7 @@ def draw_frame(env: MarkovSoccer, s: State, step_idx: int, out_dir: str):
     plt.savefig(fname)
     plt.close(fig)
     return fname
+
 
 def frames_to_gif_mp4(frames_dir: str, out_gif: str, out_mp4: str, fps: int = 3):
     files = sorted([os.path.join(frames_dir, f) for f in os.listdir(frames_dir)
@@ -488,6 +526,7 @@ def frames_to_gif_mp4(frames_dir: str, out_gif: str, out_mp4: str, fps: int = 3)
     imageio.mimsave(out_mp4, imgs, fps=fps, macro_block_size=None)
     print(f"Saved video: {out_gif}")
     print(f"Saved video: {out_mp4}")
+
 
 # ============================================================
 #                          MAIN
@@ -504,8 +543,8 @@ def main():
 
     print("Computing ground-truth Nash via Shapley value iteration...")
     V_star, PiA_star, PiB_star = shapley_value_iteration(env, tol=1e-10, max_iter=2000)
-    sA = State(2,1,1,3,0)
-    sB = State(2,1,1,3,1)
+    sA = State(2, 1, 1, 3, 0)
+    sB = State(2, 1, 1, 3, 1)
     with open(os.path.join(outdir, "ground_truth_starts.txt"), "w") as f:
         f.write(f"V*(start A-ball) = {V_star[sA]:.6f}\n")
         f.write(f"pi_A*(A-ball) over {ACTIONS} = {np.round(PiA_star[sA], 6)}\n")
@@ -553,13 +592,15 @@ def main():
         if (ep + 1) % eval_every == 0:
             mx, mn = evaluate_against_ground_truth(env, V_star, PiA_star, PiB_star,
                                                    learner.PiA, learner.PiB)
-            eval_points.append(ep + 1); eval_max_eps.append(mx); eval_mean_eps.append(mn)
-            print(f"Eval @{ep+1}: max ε={mx:.3e}, mean ε={mn:.3e}; "
+            eval_points.append(ep + 1);
+            eval_max_eps.append(mx);
+            eval_mean_eps.append(mn)
+            print(f"Eval @{ep + 1}: max ε={mx:.3e}, mean ε={mn:.3e}; "
                   f"ΔQ_max_last={learner.episode_deltas[-1]:.3e}, eps≈{learner.epsA.eps:.3f}")
 
         if (ep + 1) % 5000 == 0:
             last = disc_returns[-5000:] if len(disc_returns) >= 5000 else disc_returns
-            print(f"Episode {ep+1}: avg discounted return (last block) = {np.mean(last):.4f}, "
+            print(f"Episode {ep + 1}: avg discounted return (last block) = {np.mean(last):.4f}, "
                   f"ΔQ_max_last={learner.episode_deltas[-1]:.3e}, eps≈{learner.epsA.eps:.3f}")
 
     qpath = os.path.join(outdir, "nash_q_tables.pkl")
@@ -617,8 +658,8 @@ def main():
     draw_frame(env, s, step, frames_dir)
 
     while True:
-        x, y = ensure_policy(s)                 # <-- ensure policies exist
-        aA_idx = EpsGreedy(0).sample(x)         # sample from learned mixed policy (no ε)
+        x, y = ensure_policy(s)  # <-- ensure policies exist
+        aA_idx = EpsGreedy(0).sample(x)  # sample from learned mixed policy (no ε)
         aB_idx = EpsGreedy(0).sample(y)
         aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
 
@@ -626,7 +667,7 @@ def main():
         step += 1
         draw_frame(env, ns, step, frames_dir)
 
-        s = ns                                   # advance
+        s = ns  # advance
         if done or step > 200:
             break
 
@@ -642,6 +683,7 @@ def main():
         f.write(f"Saved Q tables: {qpath}\n")
         f.write(f"Final eval video (GIF): {out_gif}\n")
         f.write(f"Final eval video (MP4): {out_mp4}\n")
+
 
 if __name__ == "__main__":
     main()
