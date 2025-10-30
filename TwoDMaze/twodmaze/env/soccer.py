@@ -529,7 +529,7 @@ def main():
         f.write(f"pi_A*(B-ball) over {ACTIONS} = {np.round(PiA_star[sB], 6)}\n")
         f.write(f"pi_B*(B-ball) over {ACTIONS} = {np.round(PiB_star[sB], 6)}\n")
 
-    episodes = 50000
+    episodes = 100000
     learner = NashQLearner(
         gamma=env.gamma,
         alpha0=0.5,
