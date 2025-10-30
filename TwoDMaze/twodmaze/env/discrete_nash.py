@@ -36,9 +36,9 @@ class PursuitEvasionParallelEnv(ParallelEnv):
 
         # define safe zone (bottom-left corner)
         self.safe_zone = (self.grid_size - 1, 0)
-        self.terminal_reward = 30
-        self.safe_zone_distance_factor = 1
-
+        self.terminal_reward = 10  # was 30
+        self.safe_zone_distance_factor = 0.1  # was 1
+        self.distance_factor = .1
         # obstacles (list of (y,x) tuples)
         self.obstacles = set(obstacles) if obstacles is not None else set()
 
@@ -117,7 +117,7 @@ class PursuitEvasionParallelEnv(ParallelEnv):
             ev_after = abs(ey - self.safe_zone[0]) + abs(ex - self.safe_zone[1])
             ev_distance_delta = ev_before - ev_after
 
-            shaping = distance_delta - self.safe_zone_distance_factor * ev_distance_delta
+            shaping = self.distance_factor * distance_delta - self.safe_zone_distance_factor * ev_distance_delta
             rewards["pursuer"] = shaping
             rewards["evader"] = -shaping
             winner = None
@@ -338,101 +338,102 @@ def solve_both_policies_one_lp(M):
 #                NASH-Q LEARNER (ONE Q TABLE)
 # ============================================================
 class NashQLearner:
-    """
-    Single Q-table (pursuer payoff). For state s:
-      - Q[s][(ap, ae)] is scalar.
-      - Policies (x for pursuer, y for evader) and value v are
-        obtained by solving one LP on the m x n matrix built from Q[s].
-      - We keep epsilon-greedy wrappers for action selection.
-    """
-
-    def __init__(self, actions=None, alpha=0.1, gamma=1.0,
-                 eps_policy_pursuer=None, eps_policy_evader=None):
+    def __init__(self, actions, alpha=0.2, gamma=0.99,
+                 eps_policy_pursuer=None, eps_policy_evader=None,
+                 alpha_power=0.6):
         self.actions = actions
         self.nA = len(actions)
-        self.alpha = float(alpha)
         self.gamma = float(gamma)
+        self.alpha0 = float(alpha)      # initial scale; real α is visitation based
+        self.alpha_power = float(alpha_power)
 
-        self.Q = {}      # state -> {(ap, ae): q}
-        self.pi_x = {}   # state -> np.array len nA (pursuer policy)
-        self.pi_y = {}   # state -> np.array len nA (evader  policy)
-        self.V = {}      # state -> scalar value
+        self.Q = {}         # state -> {(ap,ae): q}
+        self.V = {}         # state -> scalar
+        self.pi_x = {}      # state -> pursuer policy
+        self.pi_y = {}      # state -> evader  policy
+        self.visits = {}    # state -> {(ap,ae): count}
+        self.policy_dirty = set()  # states needing LP resolve
+
         self.state = None
         self.last_ap = None
         self.last_ae = None
-
         self.eps_p = eps_policy_pursuer
         self.eps_e = eps_policy_evader
 
-        # convergence tracking
         self.episode_max_delta = 0.0
         self.episode_deltas = []
 
     def _ensure_state(self, s):
         if s not in self.Q:
             self.Q[s] = {(ap, ae): 0.0 for ap in self.actions for ae in self.actions}
+            self.V[s] = 0.0
             self.pi_x[s] = np.ones(self.nA) / self.nA
             self.pi_y[s] = np.ones(self.nA) / self.nA
-            self.V[s] = 0.0
+            self.visits[s] = {(ap, ae): 0 for ap in self.actions for ae in self.actions}
+            self.policy_dirty.add(s)
 
     def _matrix_from_Q(self, s):
         self._ensure_state(s)
-        M = np.zeros((self.nA, self.nA), dtype=float)
-        qdict = self.Q[s]
+        M = np.zeros((self.nA, self.nA))
         for ap in self.actions:
             for ae in self.actions:
-                M[ap, ae] = qdict[(ap, ae)]
+                M[ap, ae] = self.Q[s][(ap, ae)]
         return M
 
-    def _solve_policies(self, s):
+    def _solve_policies(self, s, force=False):
         self._ensure_state(s)
-        M = self._matrix_from_Q(s)
-        x, y, v = solve_both_policies_one_lp(M)
-        self.pi_x[s], self.pi_y[s], self.V[s] = x, y, v
-        return x, y, v
+        if (s in self.policy_dirty) or force:
+            M = self._matrix_from_Q(s)
+            x, y, v = solve_both_policies_one_lp(M)
+            self.pi_x[s], self.pi_y[s], self.V[s] = x, y, v
+            self.policy_dirty.discard(s)
+        return self.pi_x[s], self.pi_y[s], self.V[s]
 
     def start_state(self, s):
         self.state = s
         self._ensure_state(s)
-        self._solve_policies(s)
+        self._solve_policies(s, force=True)
 
     def act(self):
-        """
-        Returns dict {'pursuer': ap, 'evader': ae} using eps-greedy around pi_x[s], pi_y[s].
-        """
         s = self.state
-        self._ensure_state(s)
         x, y, _ = self._solve_policies(s)
         ap = self.eps_p.select_action(x) if self.eps_p else int(np.random.choice(self.nA, p=x))
         ae = self.eps_e.select_action(y) if self.eps_e else int(np.random.choice(self.nA, p=y))
         self.last_ap, self.last_ae = ap, ae
         return {"pursuer": ap, "evader": ae}
 
+    def _alpha(self, s, ap, ae):
+        # α = α0 / (1 + visits)^{alpha_power}
+        n = self.visits[s][(ap, ae)]
+        return self.alpha0 / ((1.0 + n) ** self.alpha_power)
+
     def observe(self, next_state, r_pursuer, done):
-        """
-        Update Q(s, ap, ae) with TD target r_p + γ V(next_state), where V(next) is equilibrium value.
-        """
         s = self.state
         ap, ae = self.last_ap, self.last_ae
         self._ensure_state(s)
         self._ensure_state(next_state)
 
-        # ensure V(next_state)
+        # ensure next state's value is consistent with its current Q
         self._solve_policies(next_state)
 
+        # target and visitation-based step
         target = r_pursuer + (0.0 if done else self.gamma * self.V[next_state])
-
         old_q = self.Q[s][(ap, ae)]
-        new_q = old_q + self.alpha * (target - old_q)
+        a = self._alpha(s, ap, ae)
+        new_q = old_q + a * (target - old_q)
         self.Q[s][(ap, ae)] = new_q
-        self.episode_max_delta = max(self.episode_max_delta, abs(new_q - old_q))
+        self.visits[s][(ap, ae)] += 1
 
-        # advance
+        # policy at s is now stale (Q changed) -> mark dirty
+        self.policy_dirty.add(s)
+
+        self.episode_max_delta = max(self.episode_max_delta, abs(new_q - old_q))
         self.state = next_state
 
     def end_episode(self):
         self.episode_deltas.append(self.episode_max_delta)
         self.episode_max_delta = 0.0
+
 
 
 # ============================================================
@@ -452,22 +453,110 @@ def save_nash_q(nash_learner, actions, outdir="stat"):
     print(f"Saved Nash-Q tables to {os.path.join(outdir, 'nash_q_tables.pkl')}")
 
 
+def state_exploitability(M, x, y, v):
+    """
+    Return (eps, row_gain, col_gain):
+      row_gain = max_i M[i,:] y - v
+      col_gain = v - min_j x^T M[:,j]
+      eps = max(row_gain, col_gain)
+    """
+    M = np.asarray(M, float)
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+
+    row_vals = M @ y  # length m
+    col_vals = M.T @ x  # length n
+    row_gain = float(np.max(row_vals) - v)
+    col_gain = float(v - np.min(col_vals))
+    eps = max(row_gain, col_gain)
+    return eps, row_gain, col_gain
+
+
+def nash_report(nash_learner, actions, tol=1e-4, outdir="stat"):
+    """
+    For every state in the learned Q table:
+      1) build M from Q
+      2) solve one-LP to get (x,y,v)
+      3) compute exploitability eps
+    Writes a text report and returns a dict with summary stats.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    worst = (-1.0, None, None, None)  # (eps, state, row_gain, col_gain)
+    eps_list = []
+    lines = []
+    for s in nash_learner.Q.keys():
+        # build M
+        nA = len(actions)
+        M = np.zeros((nA, nA), float)
+        for ap in actions:
+            for ae in actions:
+                M[ap, ae] = nash_learner.Q[s][(ap, ae)]
+        # policies & value implied by current Q
+        x, y, v = solve_both_policies_one_lp(M)
+        eps, row_gain, col_gain = state_exploitability(M, x, y, v)
+        eps_list.append(eps)
+        if eps > worst[0]:
+            worst = (eps, s, row_gain, col_gain)
+        lines.append(
+            f"state={s}\n  v={v:.6g}  eps={eps:.3e}  row_gain={row_gain:.3e}  col_gain={col_gain:.3e}\n"
+            f"  x={np.round(x, 6)}\n  y={np.round(y, 6)}\n"
+        )
+
+    # Aggregate
+    if eps_list:
+        eps_arr = np.array(eps_list, float)
+        summary = {
+            "num_states": len(eps_list),
+            "eps_max": float(np.max(eps_arr)),
+            "eps_mean": float(np.mean(eps_arr)),
+            "eps_median": float(np.median(eps_arr)),
+            "within_tol": int(np.sum(eps_arr <= tol)),
+            "tol": tol,
+            "worst_state": worst[1],
+            "worst_eps": worst[0],
+            "worst_row_gain": worst[2],
+            "worst_col_gain": worst[3],
+        }
+    else:
+        summary = {
+            "num_states": 0, "eps_max": None, "eps_mean": None,
+            "eps_median": None, "within_tol": 0, "tol": tol,
+            "worst_state": None, "worst_eps": None,
+            "worst_row_gain": None, "worst_col_gain": None,
+        }
+
+    # Write report
+    report_path = os.path.join(outdir, "nash_exploitability_report.txt")
+    with open(report_path, "w") as f:
+        f.write("Per-state ε-Nash (exploitability) report\n")
+        f.write(f"Tolerance: {tol}\n\n")
+        for ln in lines:
+            f.write(ln + "\n")
+        f.write("\n=== Summary ===\n")
+        for k, v in summary.items():
+            f.write(f"{k}: {v}\n")
+    print(f"Saved Nash exploitability report to {report_path}")
+    return summary
+
+
 # ============================================================
 #                           MAIN
 # ============================================================
 if __name__ == "__main__":
     # --- environment ---
-    env = PursuitEvasionParallelEnv(grid_size=5, max_steps=10, obstacles=[(0, 2), (1, 1)])
+    env = PursuitEvasionParallelEnv(grid_size=5, max_steps=50, obstacles=[(0, 2), (1, 1)])
 
     # --- actions (rows= pursuer, cols = evader) ---
     actions = list(range(4))  # up, down, left, right
 
     # --- training loop params ---
-    num_episodes = 3000
-    #num_episodes = 101
+    num_episodes = 50000
+    # num_episodes = 101
     init_eps = 0.3
+    final_eps = 0.02
     init_alpha = 0.2
-    gamma = 1.0
+    gamma = .9
+    eps_decay = (final_eps / init_eps) ** (1.0 / num_episodes)  # exponential
 
     os.makedirs("stat", exist_ok=True)
     with open(os.path.join("stat", "setting.txt"), "w") as f:
@@ -486,13 +575,13 @@ if __name__ == "__main__":
     pursuer_policy = EpsGreedyPolicy(epsilon=init_eps)
     evader_policy = EpsGreedyPolicy(epsilon=init_eps)
 
-    # --- single Nash-Q learner ---
     nash_learner = NashQLearner(
         actions=actions,
-        alpha=init_alpha,
+        alpha=0.5,  # α0 (pre-visitation): slightly larger, will shrink fast
         gamma=gamma,
-        eps_policy_pursuer=pursuer_policy,
-        eps_policy_evader=evader_policy,
+        eps_policy_pursuer=EpsGreedyPolicy(epsilon=init_eps),
+        eps_policy_evader=EpsGreedyPolicy(epsilon=init_eps),
+        alpha_power=0.6,  # 0.6 ~ Robbins–Monro style
     )
     print("ep0 Nash-Q initialized: uniform policies at unseen states")
     log_path = os.path.join("stat", "pi_log.txt")
@@ -507,13 +596,17 @@ if __name__ == "__main__":
         # start state
         state_str = env.state_key()
         nash_learner.start_state(state_str)
-
+        nash_learner.eps_p.epsilon *= eps_decay
+        nash_learner.eps_e.epsilon *= eps_decay
+        # (optional) clamp to final_eps
+        nash_learner.eps_p.epsilon = max(nash_learner.eps_p.epsilon, final_eps)
+        nash_learner.eps_e.epsilon = max(nash_learner.eps_e.epsilon, final_eps)
         # occasional logging/frames
         if (ep + 1) % 100 == 0:
             x, y, v = nash_learner._solve_policies(state_str)
             env.render(episode=ep, step=step, live=False)
             log_file.write(f"ep{ep} Nash pi_x {x}, pi_y {y}, v {v:.4f}\n")
-            print(f"ep{ep} Nash pi_x {np.round(x,4)}, pi_y {np.round(y,4)}, v {v:.4f}")
+            print(f"ep{ep} Nash pi_x {np.round(x, 4)}, pi_y {np.round(y, 4)}, v {v:.4f}")
 
         while True:
             # act using current Nash policies (+ epsilon exploration)
@@ -570,9 +663,12 @@ if __name__ == "__main__":
               f"Avg rewards: Pursuer {avg_rewards['pursuer']:.4g}; Evader {avg_rewards['evader']:.4g}")
 
     log_file.close()
+    summary = nash_report(nash_learner, actions, tol=1e-4, outdir="stat")
+    print("Exploitability summary:", summary)
 
     # ----- save Q -----
     save_nash_q(nash_learner, actions, outdir="stat")
+
 
     # ============================================================
     #                      PLOTTING
@@ -582,6 +678,7 @@ if __name__ == "__main__":
         if len(x) < window:
             return x.copy()
         return np.convolve(x, np.ones(window) / window, mode="valid")
+
 
     # Episode lengths
     plt.figure()
