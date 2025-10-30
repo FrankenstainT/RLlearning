@@ -857,8 +857,8 @@ if __name__ == "__main__":
 
             # greedy (deterministic=True) play from current Nash policies
             x, y, _ = nash_learner._solve_policies(nash_learner.state)
-            ap = nash_learner.eps_p.select_greedy_action(x, deterministic=True)
-            ae = nash_learner.eps_e.select_greedy_action(y, deterministic=True)
+            ap = nash_learner.eps_p.select_greedy_action(x, deterministic=False)
+            ae = nash_learner.eps_e.select_greedy_action(y, deterministic=False)
             actions_dict = {"pursuer": ap, "evader": ae}
 
             next_obs, rewards, terminations, truncations, infos = env.step(actions_dict)
