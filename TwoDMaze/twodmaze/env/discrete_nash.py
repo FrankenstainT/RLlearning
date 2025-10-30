@@ -34,6 +34,9 @@ class PursuitEvasionParallelEnv(ParallelEnv):
         self.step_count = 0
         self.frames = []  # store frames for animation
 
+        # episode-local RNG (set in reset)
+        self.rng = np.random.default_rng()
+
         # define safe zone (bottom-left corner)
         self.safe_zone = (self.grid_size - 1, 0)
         self.terminal_reward = 10  # was 30
@@ -53,8 +56,10 @@ class PursuitEvasionParallelEnv(ParallelEnv):
         }
 
     def reset(self, seed=None, options=None):
+        # Per-episode RNG (no global seeding)
         if seed is not None:
-            np.random.seed(seed)
+            self.rng = np.random.default_rng(seed)
+
         # positions (customize if you want)
         self.pos = {"pursuer": [0, 3], "evader": [0, 4]}
         self.step_count = 0
@@ -220,10 +225,15 @@ def save_episode_animation(episode, save_dir="renders", fps=2):
 class EpsGreedyPolicy:
     """
     Epsilon-greedy around a given mixed strategy pi_probs.
+    Uses a per-episode numpy.random.Generator.
     """
 
-    def __init__(self, epsilon=0.1):
+    def __init__(self, epsilon=0.1, rng=None):
         self.epsilon = float(epsilon)
+        self.rng = rng if rng is not None else np.random.default_rng()
+
+    def set_rng(self, rng):
+        self.rng = rng
 
     def _normalize(self, pi_probs):
         p = np.asarray(pi_probs, dtype=float).copy()
@@ -237,16 +247,16 @@ class EpsGreedyPolicy:
 
     def select_action(self, pi_probs):
         p = self._normalize(pi_probs)
-        if np.random.rand() < self.epsilon:
-            return int(np.random.choice(len(p)))
-        return int(np.random.choice(len(p), p=p))
+        if self.rng.random() < self.epsilon:
+            return int(self.rng.integers(low=0, high=len(p)))
+        return int(self.rng.choice(len(p), p=p))
 
     def select_greedy_action(self, pi_probs, deterministic=False):
         p = self._normalize(pi_probs)
         if deterministic:
             return int(np.argmax(p))
         else:
-            return int(np.random.choice(len(p), p=p))
+            return int(self.rng.choice(len(p), p=p))
 
 
 # ============================================================
@@ -490,8 +500,8 @@ class NashQLearner:
     def act(self):
         s = self.state
         x, y, _ = self._solve_policies(s)
-        ap = self.eps_p.select_action(x) if self.eps_p else int(np.random.choice(self.nA, p=x))
-        ae = self.eps_e.select_action(y) if self.eps_e else int(np.random.choice(self.nA, p=y))
+        ap = self.eps_p.select_action(x) if self.eps_p else int(np.argmax(x))
+        ae = self.eps_e.select_action(y) if self.eps_e else int(np.argmax(y))
         self.last_ap, self.last_ae = ap, ae
         return {"pursuer": ap, "evader": ae}
 
@@ -585,7 +595,6 @@ def nash_report(nash_learner, actions, tol=1e-4, outdir="stat"):
             for ae in actions:
                 M[ap, ae] = nash_learner.Q[s][(ap, ae)]
         # policies & value implied by current Q
-        # inside NashQLearner._solve_policies(self, s):
         x, y, v = solve_both_policies_one_lp(M,
                                              log_dir="stat",
                                              state_key_for_log=s)
@@ -648,7 +657,6 @@ if __name__ == "__main__":
 
     # --- training loop params ---
     num_episodes = 50000
-    # num_episodes = 101
     init_eps = 0.3
     final_eps = 0.02
     init_alpha = 0.2
@@ -668,7 +676,7 @@ if __name__ == "__main__":
     episode_lengths, pursuer_rewards, evader_rewards, winners = [], [], [], []
     pursuer_rewards_per_step, evader_rewards_per_step = [], []
 
-    # policies used for exploration/eval
+    # policies used for exploration/eval (their RNGs will be set per-episode)
     pursuer_policy = EpsGreedyPolicy(epsilon=init_eps)
     evader_policy = EpsGreedyPolicy(epsilon=init_eps)
 
@@ -676,8 +684,8 @@ if __name__ == "__main__":
         actions=actions,
         alpha=0.5,  # α0 (pre-visitation): slightly larger, will shrink fast
         gamma=gamma,
-        eps_policy_pursuer=EpsGreedyPolicy(epsilon=init_eps),
-        eps_policy_evader=EpsGreedyPolicy(epsilon=init_eps),
+        eps_policy_pursuer=pursuer_policy,
+        eps_policy_evader=evader_policy,
         alpha_power=0.6,  # 0.6 ~ Robbins–Monro style
     )
     print("ep0 Nash-Q initialized: uniform policies at unseen states")
@@ -685,7 +693,18 @@ if __name__ == "__main__":
     log_file = open(log_path, "w")
 
     for ep in range(num_episodes):
-        obs, infos = env.reset(seed=ep)
+        # ===== per-episode RNGs (no global state) =====
+        env_seed     = 17071 * (ep + 1) + 3
+        pursuer_seed = 97561 * (ep + 1) + 11
+        evader_seed  = 73421 * (ep + 1) + 29
+
+        # set env RNG for this episode
+        obs, infos = env.reset(seed=env_seed)
+
+        # set policy RNGs for this episode
+        nash_learner.eps_p.set_rng(np.random.default_rng(pursuer_seed))
+        nash_learner.eps_e.set_rng(np.random.default_rng(evader_seed))
+
         total_rewards = {"pursuer": 0.0, "evader": 0.0}
         avg_rewards = {"pursuer": 0.0, "evader": 0.0}
         step = 0
@@ -693,11 +712,11 @@ if __name__ == "__main__":
         # start state
         state_str = env.state_key()
         nash_learner.start_state(state_str)
-        nash_learner.eps_p.epsilon *= eps_decay
-        nash_learner.eps_e.epsilon *= eps_decay
-        # (optional) clamp to final_eps
-        nash_learner.eps_p.epsilon = max(nash_learner.eps_p.epsilon, final_eps)
-        nash_learner.eps_e.epsilon = max(nash_learner.eps_e.epsilon, final_eps)
+
+        # epsilon decay (use the same policy objects, just update epsilon)
+        nash_learner.eps_p.epsilon = max(final_eps, nash_learner.eps_p.epsilon * eps_decay)
+        nash_learner.eps_e.epsilon = max(final_eps, nash_learner.eps_e.epsilon * eps_decay)
+
         # occasional logging/frames
         if (ep + 1) % 100 == 0:
             x, y, v = nash_learner._solve_policies(state_str)
@@ -842,7 +861,15 @@ if __name__ == "__main__":
     print("\n=== Running Final Evaluation (Nash-Q) ===")
     eval_episodes = 1
     for ep in range(eval_episodes):
-        obs, infos = env.reset(seed=999 + ep)
+        # new RNGs for eval episode (stable & separate from training)
+        env_seed     = 2_000_003 + ep
+        pursuer_seed = 3_000_001 + ep
+        evader_seed  = 3_100_001 + ep
+
+        obs, infos = env.reset(seed=env_seed)
+        nash_learner.eps_p.set_rng(np.random.default_rng(pursuer_seed))
+        nash_learner.eps_e.set_rng(np.random.default_rng(evader_seed))
+
         step = 0
         total_rewards = {"pursuer": 0.0, "evader": 0.0}
 
@@ -851,11 +878,9 @@ if __name__ == "__main__":
 
         env.render(episode=num_episodes + ep, step=step, live=False)
         while True:
-            if nash_learner.state not in nash_learner.Q:
-                print("Eval reached unseen state:", nash_learner.state)
-            nash_learner._ensure_state(nash_learner.state)  # <-- add this
+            nash_learner._ensure_state(nash_learner.state)
 
-            # greedy (deterministic=True) play from current Nash policies
+            # greedy evaluation (use deterministic=True for pure argmax, or False to sample)
             x, y, _ = nash_learner._solve_policies(nash_learner.state)
             ap = nash_learner.eps_p.select_greedy_action(x, deterministic=False)
             ae = nash_learner.eps_e.select_greedy_action(y, deterministic=False)
