@@ -55,18 +55,49 @@ class PursuitEvasionParallelEnv(ParallelEnv):
             for agent in self.agents
         }
 
-    def reset(self, seed=None, options=None):
-        # Per-episode RNG (no global seeding)
+    def valid_cells(self):
+        """All cells except the safe zone and obstacles."""
+        valid = []
+        for y in range(self.grid_size):
+            for x in range(self.grid_size):
+                if (y, x) == self.safe_zone:
+                    continue
+                if (y, x) in self.obstacles:
+                    continue
+                valid.append((y, x))
+        return valid
+
+    def reset_to_positions(self, pursuer_pos, evader_pos, seed=None):
+        """Hard reset to specific (y,x) for each agent (overlap allowed)."""
         if seed is not None:
             self.rng = np.random.default_rng(seed)
-
-        # positions (customize if you want)
-        self.pos = {"pursuer": [0, 3], "evader": [0, 4]}
+        self.pos = {"pursuer": [int(pursuer_pos[0]), int(pursuer_pos[1])],
+                    "evader": [int(evader_pos[0]), int(evader_pos[1])]}
         self.step_count = 0
         self.frames = []
         obs = self._get_obs()
         infos = {agent: {} for agent in self.agents}
         return obs, infos
+
+    def reset(self, seed=None, options=None):
+        """
+        If options contains 'start_pos' with keys 'pursuer' and 'evader',
+        use those. Otherwise sample uniformly from valid cells.
+        Overlap is allowed (like your FrozenLake code).
+        """
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+
+        if options is not None and "start_pos" in options:
+            p0 = tuple(options["start_pos"]["pursuer"])
+            e0 = tuple(options["start_pos"]["evader"])
+            return self.reset_to_positions(p0, e0)
+        p0 = e0 = (0, 0)
+        while p0 == e0:
+            valid = self.valid_cells()
+            p0 = valid[self.rng.integers(low=0, high=len(valid))]
+            e0 = valid[self.rng.integers(low=0, high=len(valid))]
+        return self.reset_to_positions(p0, e0)
 
     def step(self, actions):
         self.step_count += 1
@@ -742,13 +773,34 @@ if __name__ == "__main__":
     # --- actions (rows= pursuer, cols = evader) ---
     actions = list(range(4))  # up, down, left, right
 
-    # --- training loop params ---
-    num_episodes = 50000
+
+    # --------- start set (no overlap) & curriculum sorting ---------
+    def manhattan(a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+    valid_cells = env.valid_cells()  # excludes safe zone & obstacles
+    S = env.safe_zone  # safe zone cell (y, x)
+
+    # All ordered pairs with NO OVERLAP
+    start_pairs = [(p, e) for p in valid_cells for e in valid_cells if p != e]
+
+    # Primary key: sum of distances to safe zone; Secondary: distance between agents
+    start_pairs.sort(key=lambda pe: (manhattan(pe[0], S) + manhattan(pe[1], S),
+                                     manhattan(pe[0], pe[1])))
+
+    # Choose exactly how many episodes per start so every start is trained equally
+    EPISODES_PER_START = 100
+    NUM_PAIRS = len(start_pairs)
+    num_episodes = EPISODES_PER_START * NUM_PAIRS  # override to ensure equality
+
+    # Recompute schedules that depend on total count
     init_eps = 0.3
     final_eps = 0.02
+    eps_decay = (final_eps / init_eps) ** (1.0 / max(1, num_episodes))  # exponential
+
     init_alpha = 0.2
     gamma = .9
-    eps_decay = (final_eps / init_eps) ** (1.0 / num_episodes)  # exponential
 
     os.makedirs("stat", exist_ok=True)
     with open(os.path.join("stat", "setting.txt"), "w") as f:
@@ -783,103 +835,106 @@ if __name__ == "__main__":
     policy_drift_rows = []
     prev_snapshot = nash_learner.snapshot_policies()  # episode 0 baseline
 
-    for ep in range(num_episodes):
-        # ===== per-episode RNGs (no global state) =====
-        env_seed = 17071 * (ep + 1) + 3
-        pursuer_seed = 97561 * (ep + 1) + 11
-        evader_seed = 73421 * (ep + 1) + 29
+    ep = 0  # global episode counter used for schedules & logging
+    for (p0, e0) in start_pairs:
+        for _rep in range(EPISODES_PER_START):
+            # ===== per-episode RNGs (no global state) =====
+            env_seed = 17071 * (ep + 1) + 3
+            pursuer_seed = 97561 * (ep + 1) + 11
+            evader_seed = 73421 * (ep + 1) + 29
 
-        # set env RNG for this episode
-        obs, infos = env.reset(seed=env_seed)
-
-        # set policy RNGs for this episode
-        nash_learner.eps_p.set_rng(np.random.default_rng(pursuer_seed))
-        nash_learner.eps_e.set_rng(np.random.default_rng(evader_seed))
-
-        total_rewards = {"pursuer": 0.0, "evader": 0.0}
-        avg_rewards = {"pursuer": 0.0, "evader": 0.0}
-        step = 0
-
-        # start state
-        state_str = env.state_key()
-        nash_learner.start_state(state_str)
-
-        # epsilon decay (use the same policy objects, just update epsilon)
-        nash_learner.eps_p.epsilon = max(final_eps, nash_learner.eps_p.epsilon * eps_decay)
-        nash_learner.eps_e.epsilon = max(final_eps, nash_learner.eps_e.epsilon * eps_decay)
-
-        # occasional logging/frames
-        if (ep + 1) % 100 == 0:
-            x, y, v = nash_learner._solve_policies(state_str)
-            env.render(episode=ep, step=step, live=False)
-            log_file.write(f"ep{ep} Nash pi_x {x}, pi_y {y}, v {v:.4f}\n")
-            print(f"ep{ep} Nash pi_x {np.round(x, 4)}, pi_y {np.round(y, 4)}, v {v:.4f}")
-
-        while True:
-            # act using current Nash policies (+ epsilon exploration)
-            joint = nash_learner.act()
-            actions_dict = {"pursuer": joint["pursuer"], "evader": joint["evader"]}
-
-            # env step
-            next_obs, rewards, terminations, truncations, infos = env.step(actions_dict)
-            done = any(terminations.values()) or any(truncations.values())
-
-            # accumulate returns
-            total_rewards["pursuer"] += rewards["pursuer"]
-            total_rewards["evader"] += rewards["evader"]
-
-            # learn from pursuer payoff only
-            next_state_str = env.state_key()
-            nash_learner.observe(
-                next_state=next_state_str,
-                r_pursuer=rewards["pursuer"],
-                done=done
+            # set env RNG and reset to the chosen non-overlap positions
+            obs, infos = env.reset(
+                seed=env_seed,
+                options={"start_pos": {"pursuer": p0, "evader": e0}}
             )
 
+            # set policy RNGs for this episode
+            nash_learner.eps_p.set_rng(np.random.default_rng(pursuer_seed))
+            nash_learner.eps_e.set_rng(np.random.default_rng(evader_seed))
+
+            total_rewards = {"pursuer": 0.0, "evader": 0.0}
+            avg_rewards = {"pursuer": 0.0, "evader": 0.0}
+            step = 0
+
+            # start state
+            state_str = env.state_key()
+            nash_learner.start_state(state_str)
+
+            # epsilon decay & (optional) learning-rate schedule if you add one later
+            nash_learner.eps_p.epsilon = max(final_eps, nash_learner.eps_p.epsilon * eps_decay)
+            nash_learner.eps_e.epsilon = max(final_eps, nash_learner.eps_e.epsilon * eps_decay)
+
+            # occasional logging/frames
             if (ep + 1) % 100 == 0:
-                env.render(episode=ep, step=step + 1, live=False)
+                x, y, v = nash_learner._solve_policies(state_str)
+                #env.render(episode=ep, step=step, live=False)
+                #log_file.write(f"ep{ep} Nash pi_x {x}, pi_y {y}, v {v:.4f}\n")
+                print(f"ep{ep} Nash pi_x {np.round(x, 4)}, pi_y {np.round(y, 4)}, v {v:.4f}")
 
-            step += 1
-            if done:
-                winners.append(infos["pursuer"]["winner"])
-                break
+            while True:
+                joint = nash_learner.act()
+                actions_dict = {"pursuer": joint["pursuer"], "evader": joint["evader"]}
 
-        # bookkeeping for plots
-        for agent in total_rewards:
-            returns[agent].append(total_rewards[agent])
-        nash_learner.end_episode()
+                next_obs, rewards, terminations, truncations, infos = env.step(actions_dict)
+                done = any(terminations.values()) or any(truncations.values())
 
-        pursuer_rewards.append(total_rewards["pursuer"])
-        evader_rewards.append(total_rewards["evader"])
-        avg_rewards["pursuer"] = total_rewards["pursuer"] / step
-        avg_rewards["evader"] = total_rewards["evader"] / step
-        pursuer_rewards_per_step.append(avg_rewards["pursuer"])
-        evader_rewards_per_step.append(avg_rewards["evader"])
-        episode_lengths.append(step)
+                total_rewards["pursuer"] += rewards["pursuer"]
+                total_rewards["evader"] += rewards["evader"]
 
-        # every 100 episodes: moving average over last 100
-        if (ep + 1) % 100 == 0:
-            for agent in returns:
-                avg = np.mean(returns[agent][-100:])
-                avg_returns[agent].append(avg)
-            print(f"Episode {ep}, Avg(100) pursuer={avg_returns['pursuer'][-1]:.3f}, "
-                  f"evader={avg_returns['evader'][-1]:.3f}")
-            save_episode_animation(ep)
+                next_state_str = env.state_key()
+                nash_learner.observe(
+                    next_state=next_state_str,
+                    r_pursuer=rewards["pursuer"],
+                    done=done
+                )
 
-        print(f"Episode {ep} finished in {step} steps. "
-              f"Avg rewards: Pursuer {avg_rewards['pursuer']:.4g}; Evader {avg_rewards['evader']:.4g}")
-        # --- policy drift (L1 / TV) between episodes ---
-        drift = nash_learner.policy_drift(prev_snapshot)
-        prev_snapshot = drift["current_snapshot"]  # roll forward
+                # if (ep + 1) % 100 == 0:
+                #     env.render(episode=ep, step=step + 1, live=False)
 
-        policy_drift_rows.append({
-            "episode": ep,
-            "states": drift["agg"]["count"],
-            "l1_x_max": drift["agg"]["l1_x_max"], "l1_x_mean": drift["agg"]["l1_x_mean"],
-            "l1_y_max": drift["agg"]["l1_y_max"], "l1_y_mean": drift["agg"]["l1_y_mean"],
-            "tv_x_max": drift["agg"]["tv_x_max"], "tv_x_mean": drift["agg"]["tv_x_mean"],
-            "tv_y_max": drift["agg"]["tv_y_max"], "tv_y_mean": drift["agg"]["tv_y_mean"],
-        })
+                step += 1
+                if done:
+                    winners.append(infos["pursuer"]["winner"])
+                    break
+
+            # bookkeeping for plots
+            for agent in total_rewards:
+                returns[agent].append(total_rewards[agent])
+            nash_learner.end_episode()
+
+            pursuer_rewards.append(total_rewards["pursuer"])
+            evader_rewards.append(total_rewards["evader"])
+            avg_rewards["pursuer"] = total_rewards["pursuer"] / step
+            avg_rewards["evader"] = total_rewards["evader"] / step
+            pursuer_rewards_per_step.append(avg_rewards["pursuer"])
+            evader_rewards_per_step.append(avg_rewards["evader"])
+            episode_lengths.append(step)
+
+            # every 100 episodes: moving average over last 100
+            if (ep + 1) % 100 == 0:
+                for agent in returns:
+                    avg = np.mean(returns[agent][-100:])
+                    avg_returns[agent].append(avg)
+                print(f"Episode {ep}, Avg(100) pursuer={avg_returns['pursuer'][-1]:.3f}, "
+                      f"evader={avg_returns['evader'][-1]:.3f}")
+                save_episode_animation(ep)
+
+            print(f"Episode {ep} finished in {step} steps. "
+                  f"Avg rewards: Pursuer {avg_rewards['pursuer']:.4g}; Evader {avg_rewards['evader']:.4g}")
+
+            # --- policy drift (L1 / TV) between episodes ---
+            drift = nash_learner.policy_drift(prev_snapshot)
+            prev_snapshot = drift["current_snapshot"]  # roll forward
+            policy_drift_rows.append({
+                "episode": ep,
+                "states": drift["agg"]["count"],
+                "l1_x_max": drift["agg"]["l1_x_max"], "l1_x_mean": drift["agg"]["l1_x_mean"],
+                "l1_y_max": drift["agg"]["l1_y_max"], "l1_y_mean": drift["agg"]["l1_y_mean"],
+                "tv_x_max": drift["agg"]["tv_x_max"], "tv_x_mean": drift["agg"]["tv_x_mean"],
+                "tv_y_max": drift["agg"]["tv_y_max"], "tv_y_mean": drift["agg"]["tv_y_mean"],
+            })
+
+            ep += 1  # advance global episode index
 
     log_file.close()
     summary = nash_report(nash_learner, actions, tol=1e-4, outdir="stat")
@@ -895,17 +950,17 @@ if __name__ == "__main__":
         w.writerows(policy_drift_rows)
     print(f"Saved per-episode policy drift to {csv_path}")
 
-    # Plot TV means (bounded in [0,1]) and/or L1 means (bounded in [0,2])
+    # Plot L1 maxs (bounded in [0,1]) and/or L1 means (bounded in [0,2])
     plt.figure()
-    plt.plot([r["episode"] for r in policy_drift_rows], [r["tv_x_mean"] for r in policy_drift_rows],
-             label="TV mean (pursuer)")
-    plt.plot([r["episode"] for r in policy_drift_rows], [r["tv_y_mean"] for r in policy_drift_rows],
-             label="TV mean (evader)")
+    plt.plot([r["episode"] for r in policy_drift_rows], [r["l1_x_max"] for r in policy_drift_rows],
+             label="L1 max (pursuer)")
+    plt.plot([r["episode"] for r in policy_drift_rows], [r["l1_y_max"] for r in policy_drift_rows],
+             label="L1 max (evader)")
     plt.xlabel("Episode");
-    plt.ylabel("Total Variation distance (mean)")
+    plt.ylabel("L1 distance (max)")
     plt.title("Policy Drift (episode-to-episode)")
     plt.legend()
-    plt.savefig(os.path.join("stat", "policy_drift_tv.png"))
+    plt.savefig(os.path.join("stat", "policy_drift_l1_max.png"))
 
     plt.figure()
     plt.plot([r["episode"] for r in policy_drift_rows], [r["l1_x_mean"] for r in policy_drift_rows],
@@ -916,7 +971,7 @@ if __name__ == "__main__":
     plt.ylabel("L1 distance (mean)")
     plt.title("Policy Drift (episode-to-episode)")
     plt.legend()
-    plt.savefig(os.path.join("stat", "policy_drift_l1.png"))
+    plt.savefig(os.path.join("stat", "policy_drift_l1_mean.png"))
 
 
     # ============================================================
