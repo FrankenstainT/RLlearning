@@ -266,16 +266,18 @@ import numpy as np
 from scipy.optimize import linprog
 import os, json
 
+
 def _sanitize_and_scale(M):
     M = np.array(M, dtype=float)
     # Replace non-finite with 0 (rare, but fatal to HiGHS)
     M[~np.isfinite(M)] = 0.0
     # Center & scale to tame magnitudes (policies invariant to shift/scale)
-    c = float(np.median(M))               # shift by median (robust)
+    c = float(np.median(M))  # shift by median (robust)
     M0 = M - c
     k = float(np.max(np.abs(M0))) or 1.0  # avoid divide by zero
     M1 = M0 / k
     return M1, c, k
+
 
 def _one_lp_core(M, slack=1e-9, options=None):
     M = np.asarray(M, float)
@@ -283,7 +285,7 @@ def _one_lp_core(M, slack=1e-9, options=None):
     num_vars = m + n + 1
     x_slice = slice(0, m)
     y_slice = slice(m, m + n)
-    v_idx   = m + n
+    v_idx = m + n
 
     c_obj = np.zeros(num_vars)
     c_obj[v_idx] = -1.0  # maximize v
@@ -295,15 +297,17 @@ def _one_lp_core(M, slack=1e-9, options=None):
     for j in range(n):
         row = np.zeros(num_vars)
         row[x_slice] = -M[:, j]
-        row[v_idx]   =  1.0
-        A_ub.append(row); b_ub.append(slack)
+        row[v_idx] = 1.0
+        A_ub.append(row);
+        b_ub.append(slack)
 
     # M[i,:] y <= v + slack
     for i in range(m):
         row = np.zeros(num_vars)
         row[y_slice] = M[i, :]
-        row[v_idx]   = -1.0
-        A_ub.append(row); b_ub.append(slack)
+        row[v_idx] = -1.0
+        A_ub.append(row);
+        b_ub.append(slack)
 
     A_ub = np.vstack(A_ub)
     b_ub = np.array(b_ub)
@@ -321,6 +325,7 @@ def _one_lp_core(M, slack=1e-9, options=None):
                   options=(options or {"presolve": True}))
     return res
 
+
 def _two_lp_fallback(M):
     """Solve row player's maxmin and column player's minmax with two LPs."""
     M = np.asarray(M, float)
@@ -330,7 +335,8 @@ def _two_lp_fallback(M):
     # Convert to minimize -t
     num_vars_x = m + 1
     t_idx = m
-    c_x = np.zeros(num_vars_x); c_x[t_idx] = -1.0
+    c_x = np.zeros(num_vars_x);
+    c_x[t_idx] = -1.0
 
     A_ub_x = []
     b_ub_x = []
@@ -339,9 +345,11 @@ def _two_lp_fallback(M):
         row = np.zeros(num_vars_x)
         row[:m] = -M[:, j]
         row[t_idx] = 1.0
-        A_ub_x.append(row); b_ub_x.append(0.0)
+        A_ub_x.append(row);
+        b_ub_x.append(0.0)
 
-    A_eq_x = np.zeros((1, num_vars_x)); A_eq_x[0, :m] = 1.0
+    A_eq_x = np.zeros((1, num_vars_x));
+    A_eq_x[0, :m] = 1.0
     b_eq_x = np.array([1.0])
     bounds_x = [(0, None)] * m + [(None, None)]
     res_x = linprog(c_x, A_ub=np.vstack(A_ub_x), b_ub=np.array(b_ub_x),
@@ -349,13 +357,15 @@ def _two_lp_fallback(M):
     if res_x.status != 0:
         raise RuntimeError(f"Row LP failed: {res_x.message}")
     x = res_x.x[:m].clip(min=0)
-    x_sum = x.sum(); x = x/x_sum if x_sum > 0 else np.ones(m)/m
+    x_sum = x.sum();
+    x = x / x_sum if x_sum > 0 else np.ones(m) / m
     v1 = res_x.x[t_idx]
 
     # Column player (y): minimize s.t. M y <= s*1, 1^T y=1, y>=0
     num_vars_y = n + 1
     s_idx = n
-    c_y = np.zeros(num_vars_y); c_y[s_idx] = 1.0
+    c_y = np.zeros(num_vars_y);
+    c_y[s_idx] = 1.0
 
     A_ub_y = []
     b_ub_y = []
@@ -364,9 +374,11 @@ def _two_lp_fallback(M):
         row = np.zeros(num_vars_y)
         row[:n] = M[i, :]
         row[s_idx] = -1.0
-        A_ub_y.append(row); b_ub_y.append(0.0)
+        A_ub_y.append(row);
+        b_ub_y.append(0.0)
 
-    A_eq_y = np.zeros((1, num_vars_y)); A_eq_y[0, :n] = 1.0
+    A_eq_y = np.zeros((1, num_vars_y));
+    A_eq_y[0, :n] = 1.0
     b_eq_y = np.array([1.0])
     bounds_y = [(0, None)] * n + [(None, None)]
     res_y = linprog(c_y, A_ub=np.vstack(A_ub_y), b_ub=np.array(b_ub_y),
@@ -374,12 +386,14 @@ def _two_lp_fallback(M):
     if res_y.status != 0:
         raise RuntimeError(f"Column LP failed: {res_y.message}")
     y = res_y.x[:n].clip(min=0)
-    y_sum = y.sum(); y = y/y_sum if y_sum > 0 else np.ones(n)/n
+    y_sum = y.sum();
+    y = y / y_sum if y_sum > 0 else np.ones(n) / n
     v2 = res_y.x[s_idx]
 
     # In exact zero-sum, v1 ≈ v2. Return their average for robustness.
     v = 0.5 * (v1 + v2)
     return x, y, v
+
 
 def solve_both_policies_one_lp(M, log_dir="stat", state_key_for_log=None):
     """
@@ -394,10 +408,12 @@ def solve_both_policies_one_lp(M, log_dir="stat", state_key_for_log=None):
     if res.status == 0:
         z = res.x
         m, n = M1.shape
-        x = z[:m].clip(min=0); y = z[m:m+n].clip(min=0); v = z[m+n]
+        x = z[:m].clip(min=0);
+        y = z[m:m + n].clip(min=0);
+        v = z[m + n]
         sx, sy = x.sum(), y.sum()
-        x = x/sx if sx > 0 else np.ones(m)/m
-        y = y/sy if sy > 0 else np.ones(n)/n
+        x = x / sx if sx > 0 else np.ones(m) / m
+        y = y / sy if sy > 0 else np.ones(n) / n
         v_real = k_scale * v + c_shift
         return x, y, v_real
 
@@ -408,10 +424,12 @@ def solve_both_policies_one_lp(M, log_dir="stat", state_key_for_log=None):
     if res2.status == 0:
         z = res2.x
         m, n = M1.shape
-        x = z[:m].clip(min=0); y = z[m:m+n].clip(min=0); v = z[m+n]
+        x = z[:m].clip(min=0);
+        y = z[m:m + n].clip(min=0);
+        v = z[m + n]
         sx, sy = x.sum(), y.sum()
-        x = x/sx if sx > 0 else np.ones(m)/m
-        y = y/sy if sy > 0 else np.ones(n)/n
+        x = x / sx if sx > 0 else np.ones(m) / m
+        y = y / sy if sy > 0 else np.ones(n) / n
         v_real = k_scale * v + c_shift
         return x, y, v_real
 
@@ -445,14 +463,14 @@ class NashQLearner:
         self.actions = actions
         self.nA = len(actions)
         self.gamma = float(gamma)
-        self.alpha0 = float(alpha)      # initial scale; real α is visitation based
+        self.alpha0 = float(alpha)  # initial scale; real α is visitation based
         self.alpha_power = float(alpha_power)
 
-        self.Q = {}         # state -> {(ap,ae): q}
-        self.V = {}         # state -> scalar
-        self.pi_x = {}      # state -> pursuer policy
-        self.pi_y = {}      # state -> evader  policy
-        self.visits = {}    # state -> {(ap,ae): count}
+        self.Q = {}  # state -> {(ap,ae): q}
+        self.V = {}  # state -> scalar
+        self.pi_x = {}  # state -> pursuer policy
+        self.pi_y = {}  # state -> evader  policy
+        self.visits = {}  # state -> {(ap,ae): count}
         self.policy_dirty = set()  # states needing LP resolve
 
         self.state = None
@@ -537,6 +555,75 @@ class NashQLearner:
         self.episode_deltas.append(self.episode_max_delta)
         self.episode_max_delta = 0.0
 
+    def _resolve_all_policies(self):
+        """Force-solve policies for all known states so comparisons are apples-to-apples."""
+        for s in self.Q.keys():
+            self._solve_policies(s)  # respects policy_dirty
+
+    def snapshot_policies(self):
+        """
+        Return a deep snapshot of current policies (after resolving all).
+        Format: {"x": {state: np.array}, "y": {state: np.array}}
+        """
+        self._resolve_all_policies()
+        snap_x = {s: self.pi_x[s].copy() for s in self.pi_x}
+        snap_y = {s: self.pi_y[s].copy() for s in self.pi_y}
+        return {"x": snap_x, "y": snap_y}
+
+    @staticmethod
+    def _l1(a, b):
+        return float(np.sum(np.abs(np.asarray(a) - np.asarray(b))))
+
+    def policy_drift(self, prev_snapshot):
+        """
+        Compare current policies to prev_snapshot.
+        Returns:
+          {
+            "per_state": {state: {"l1_x":..., "l1_y":..., "tv_x":..., "tv_y":...}},
+            "agg": {"count":N, "l1_x_max":..., "l1_x_mean":..., "l1_y_max":..., ...,
+                    "tv_x_max":..., "tv_x_mean":..., "tv_y_max":..., "tv_y_mean":...}
+          }
+        """
+        cur = self.snapshot_policies()  # force-resolves
+        states = sorted(set(cur["x"].keys()) | set(prev_snapshot["x"].keys()))
+        per_state = {}
+        l1x, l1y, tvx, tvy = [], [], [], []
+        for s in states:
+            # Missing states → compare against uniform (conservative & well-defined)
+            def get_or_uniform(dic, state):
+                if state in dic:
+                    return dic[state]
+                # fall back to uniform of correct dimension
+                nA = len(next(iter(cur["x"].values())))
+                return np.ones(nA) / nA
+
+            x_prev = get_or_uniform(prev_snapshot["x"], s)
+            y_prev = get_or_uniform(prev_snapshot["y"], s)
+            x_cur = get_or_uniform(cur["x"], s)
+            y_cur = get_or_uniform(cur["y"], s)
+
+            lx = self._l1(x_prev, x_cur)
+            ly = self._l1(y_prev, y_cur)
+            tx = 0.5 * lx  # TV distance = 0.5 * L1 for distributions
+            ty = 0.5 * ly
+
+            per_state[s] = {"l1_x": lx, "l1_y": ly, "tv_x": tx, "tv_y": ty}
+            l1x.append(lx);
+            l1y.append(ly);
+            tvx.append(tx);
+            tvy.append(ty)
+
+        def agg(arr, fn):
+            return float(fn(arr)) if arr else 0.0
+
+        agg_stats = {
+            "count": len(states),
+            "l1_x_max": agg(l1x, np.max), "l1_x_mean": agg(l1x, np.mean), "l1_x_median": agg(l1x, np.median),
+            "l1_y_max": agg(l1y, np.max), "l1_y_mean": agg(l1y, np.mean), "l1_y_median": agg(l1y, np.median),
+            "tv_x_max": agg(tvx, np.max), "tv_x_mean": agg(tvx, np.mean), "tv_x_median": agg(tvx, np.median),
+            "tv_y_max": agg(tvy, np.max), "tv_y_mean": agg(tvy, np.mean), "tv_y_median": agg(tvy, np.median),
+        }
+        return {"per_state": per_state, "agg": agg_stats, "current_snapshot": cur}
 
 
 # ============================================================
@@ -691,12 +778,16 @@ if __name__ == "__main__":
     print("ep0 Nash-Q initialized: uniform policies at unseen states")
     log_path = os.path.join("stat", "pi_log.txt")
     log_file = open(log_path, "w")
+    import csv
+
+    policy_drift_rows = []
+    prev_snapshot = nash_learner.snapshot_policies()  # episode 0 baseline
 
     for ep in range(num_episodes):
         # ===== per-episode RNGs (no global state) =====
-        env_seed     = 17071 * (ep + 1) + 3
+        env_seed = 17071 * (ep + 1) + 3
         pursuer_seed = 97561 * (ep + 1) + 11
-        evader_seed  = 73421 * (ep + 1) + 29
+        evader_seed = 73421 * (ep + 1) + 29
 
         # set env RNG for this episode
         obs, infos = env.reset(seed=env_seed)
@@ -777,6 +868,18 @@ if __name__ == "__main__":
 
         print(f"Episode {ep} finished in {step} steps. "
               f"Avg rewards: Pursuer {avg_rewards['pursuer']:.4g}; Evader {avg_rewards['evader']:.4g}")
+        # --- policy drift (L1 / TV) between episodes ---
+        drift = nash_learner.policy_drift(prev_snapshot)
+        prev_snapshot = drift["current_snapshot"]  # roll forward
+
+        policy_drift_rows.append({
+            "episode": ep,
+            "states": drift["agg"]["count"],
+            "l1_x_max": drift["agg"]["l1_x_max"], "l1_x_mean": drift["agg"]["l1_x_mean"],
+            "l1_y_max": drift["agg"]["l1_y_max"], "l1_y_mean": drift["agg"]["l1_y_mean"],
+            "tv_x_max": drift["agg"]["tv_x_max"], "tv_x_mean": drift["agg"]["tv_x_mean"],
+            "tv_y_max": drift["agg"]["tv_y_max"], "tv_y_mean": drift["agg"]["tv_y_mean"],
+        })
 
     log_file.close()
     summary = nash_report(nash_learner, actions, tol=1e-4, outdir="stat")
@@ -784,6 +887,36 @@ if __name__ == "__main__":
 
     # ----- save Q -----
     save_nash_q(nash_learner, actions, outdir="stat")
+    # Save CSV
+    csv_path = os.path.join("stat", "policy_drift.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(policy_drift_rows[0].keys()))
+        w.writeheader();
+        w.writerows(policy_drift_rows)
+    print(f"Saved per-episode policy drift to {csv_path}")
+
+    # Plot TV means (bounded in [0,1]) and/or L1 means (bounded in [0,2])
+    plt.figure()
+    plt.plot([r["episode"] for r in policy_drift_rows], [r["tv_x_mean"] for r in policy_drift_rows],
+             label="TV mean (pursuer)")
+    plt.plot([r["episode"] for r in policy_drift_rows], [r["tv_y_mean"] for r in policy_drift_rows],
+             label="TV mean (evader)")
+    plt.xlabel("Episode");
+    plt.ylabel("Total Variation distance (mean)")
+    plt.title("Policy Drift (episode-to-episode)")
+    plt.legend()
+    plt.savefig(os.path.join("stat", "policy_drift_tv.png"))
+
+    plt.figure()
+    plt.plot([r["episode"] for r in policy_drift_rows], [r["l1_x_mean"] for r in policy_drift_rows],
+             label="L1 mean (pursuer)")
+    plt.plot([r["episode"] for r in policy_drift_rows], [r["l1_y_mean"] for r in policy_drift_rows],
+             label="L1 mean (evader)")
+    plt.xlabel("Episode");
+    plt.ylabel("L1 distance (mean)")
+    plt.title("Policy Drift (episode-to-episode)")
+    plt.legend()
+    plt.savefig(os.path.join("stat", "policy_drift_l1.png"))
 
 
     # ============================================================
@@ -862,9 +995,9 @@ if __name__ == "__main__":
     eval_episodes = 1
     for ep in range(eval_episodes):
         # new RNGs for eval episode (stable & separate from training)
-        env_seed     = 2_000_003 + ep
+        env_seed = 2_000_003 + ep
         pursuer_seed = 3_000_001 + ep
-        evader_seed  = 3_100_001 + ep
+        evader_seed = 3_100_001 + ep
 
         obs, infos = env.reset(seed=env_seed)
         nash_learner.eps_p.set_rng(np.random.default_rng(pursuer_seed))
