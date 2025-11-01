@@ -438,6 +438,66 @@ class NashQLearner:
         self.epsA.eps = max(self.epsA.eps * self.eps_decay, 0.02)
         self.epsB.eps = max(self.epsB.eps * self.eps_decay, 0.02)
 
+    def snapshot_policies(self):
+        """
+        Resolve policies for all known states and return a deep snapshot.
+        Format: {"A": {state: np.array}, "B": {state: np.array}}
+        """
+        for s in list(self.Q.keys()):
+            self._solve(s)
+        snapA = {s: self.PiA[s].copy() for s in self.PiA}
+        snapB = {s: self.PiB[s].copy() for s in self.PiB}
+        return {"A": snapA, "B": snapB}
+
+    @staticmethod
+    def _l1(a, b):
+        return float(np.sum(np.abs(np.asarray(a) - np.asarray(b))))
+
+    def policy_drift(self, prev_snapshot):
+        """
+        Compare current policies to prev_snapshot using L1 & TV (0.5*L1).
+        Returns {"per_state": ..., "agg": ..., "current_snapshot": ...}
+        """
+        cur = self.snapshot_policies()
+        # union of states
+        states = set(cur["A"].keys()) | set(prev_snapshot["A"].keys()) | \
+                 set(cur["B"].keys()) | set(prev_snapshot["B"].keys())
+        nA = len(ACTIONS)
+        per_state = {}
+        l1A, l1B, tvA, tvB = [], [], [], []
+
+        def get_or_uniform(dic, s):
+            if s in dic:
+                return dic[s]
+            return np.ones(nA) / nA
+
+        for s in states:
+            a_prev = get_or_uniform(prev_snapshot["A"], s)
+            b_prev = get_or_uniform(prev_snapshot["B"], s)
+            a_cur = get_or_uniform(cur["A"], s)
+            b_cur = get_or_uniform(cur["B"], s)
+
+            la = self._l1(a_prev, a_cur)
+            lb = self._l1(b_prev, b_cur)
+            ta, tb = 0.5 * la, 0.5 * lb
+            per_state[s] = {"l1_A": la, "l1_B": lb, "tv_A": ta, "tv_B": tb}
+            l1A.append(la);
+            l1B.append(lb);
+            tvA.append(ta);
+            tvB.append(tb)
+
+        def agg(xs, fn):
+            return float(fn(xs)) if xs else 0.0
+
+        agg_stats = {
+            "count": len(states),
+            "l1_A_max": agg(l1A, np.max), "l1_A_mean": agg(l1A, np.mean), "l1_A_median": agg(l1A, np.median),
+            "l1_B_max": agg(l1B, np.max), "l1_B_mean": agg(l1B, np.mean), "l1_B_median": agg(l1B, np.median),
+            "tv_A_max": agg(tvA, np.max), "tv_A_mean": agg(tvA, np.mean), "tv_A_median": agg(tvA, np.median),
+            "tv_B_max": agg(tvB, np.max), "tv_B_mean": agg(tvB, np.mean), "tv_B_median": agg(tvB, np.median),
+        }
+        return {"per_state": per_state, "agg": agg_stats, "current_snapshot": cur}
+
 
 # ============================================================
 #                    EXPLOITABILITY (optional)
@@ -480,6 +540,79 @@ def save_q_tables_pickle(learner: NashQLearner, outpath: str):
         mats[s] = M
     with open(outpath, "wb") as f:
         pickle.dump(mats, f)
+
+
+def nash_report_all_states(learner: NashQLearner, outdir: str, tol: float = 1e-4):
+    """
+    For every state that appears in learner.Q:
+      - build stage matrix from current Q
+      - solve (x,y,v)
+      - compute exploitability ε
+    Saves a text report, returns a summary dict.
+    """
+    ensure_dir(outdir)
+    nA = len(ACTIONS)
+    worst = (-1.0, None, None, None)  # (eps, state, row_gain, col_gain)
+    eps_list = []
+    lines = []
+
+    for s in learner.Q.keys():
+        M = np.zeros((nA, nA), float)
+        for i in range(nA):
+            for j in range(nA):
+                M[i, j] = learner.Q[s][(i, j)]
+        # solve on the *current Q* stage-game
+        x, y, v = solve_both_policies_one_lp(M)
+        # exploitability
+        row_vals = M @ y
+        col_vals = M.T @ x
+        row_gain = float(row_vals.max() - v)
+        col_gain = float(v - col_vals.min())
+        eps = max(row_gain, col_gain)
+
+        eps_list.append(eps)
+        if eps > worst[0]:
+            worst = (eps, s, row_gain, col_gain)
+        lines.append(
+            f"state={s}\n  v={v:.6g}  eps={eps:.3e}  row_gain={row_gain:.3e}  col_gain={col_gain:.3e}\n"
+            f"  x={np.round(x, 6)}\n  y={np.round(y, 6)}\n"
+        )
+
+    if eps_list:
+        arr = np.asarray(eps_list, float)
+        summary = {
+            "num_states": len(eps_list),
+            "eps_max": float(np.max(arr)),
+            "eps_mean": float(np.mean(arr)),
+            "eps_median": float(np.median(arr)),
+            "within_tol": int(np.sum(arr <= tol)),
+            "tol": tol,
+            "worst_state": worst[1],
+            "worst_eps": worst[0],
+            "worst_row_gain": worst[2],
+            "worst_col_gain": worst[3],
+        }
+    else:
+        summary = {
+            "num_states": 0, "eps_max": None, "eps_mean": None, "eps_median": None,
+            "within_tol": 0, "tol": tol, "worst_state": None, "worst_eps": None,
+            "worst_row_gain": None, "worst_col_gain": None,
+        }
+
+    # save text report
+    report_path = os.path.join(outdir, "nash_exploitability_report.txt")
+    with open(report_path, "w") as f:
+        f.write("Per-state ε-Nash (exploitability) report\n")
+        f.write(f"Tolerance: {tol}\n\n")
+        for ln in lines:
+            f.write(ln + "\n")
+        f.write("\n=== Summary ===\n")
+        for k, v in summary.items():
+            f.write(f"{k}: {v}\n")
+
+    # also print brief summary
+    print("[Nash report]", summary)
+    return summary, report_path
 
 
 def draw_frame(env: MarkovSoccer, s: State, step_idx: int, out_dir: str):
@@ -541,19 +674,33 @@ def main():
 
     env = MarkovSoccer()  # 4x5, gamma=0.9
 
-    print("Computing ground-truth Nash via Shapley value iteration...")
-    V_star, PiA_star, PiB_star = shapley_value_iteration(env, tol=1e-10, max_iter=2000)
-    sA = State(2, 1, 1, 3, 0)
-    sB = State(2, 1, 1, 3, 1)
-    with open(os.path.join(outdir, "ground_truth_starts.txt"), "w") as f:
-        f.write(f"V*(start A-ball) = {V_star[sA]:.6f}\n")
-        f.write(f"pi_A*(A-ball) over {ACTIONS} = {np.round(PiA_star[sA], 6)}\n")
-        f.write(f"pi_B*(A-ball) over {ACTIONS} = {np.round(PiB_star[sA], 6)}\n\n")
-        f.write(f"V*(start B-ball) = {V_star[sB]:.6f}\n")
-        f.write(f"pi_A*(B-ball) over {ACTIONS} = {np.round(PiA_star[sB], 6)}\n")
-        f.write(f"pi_B*(B-ball) over {ACTIONS} = {np.round(PiB_star[sB], 6)}\n")
+    # print("Computing ground-truth Nash via Shapley value iteration...")
+    # V_star, PiA_star, PiB_star = shapley_value_iteration(env, tol=1e-10, max_iter=2000)
+    # sA = State(2, 1, 1, 3, 0)
+    # sB = State(2, 1, 1, 3, 1)
+    # with open(os.path.join(outdir, "ground_truth_starts.txt"), "w") as f:
+    #     f.write(f"V*(start A-ball) = {V_star[sA]:.6f}\n")
+    #     f.write(f"pi_A*(A-ball) over {ACTIONS} = {np.round(PiA_star[sA], 6)}\n")
+    #     f.write(f"pi_B*(A-ball) over {ACTIONS} = {np.round(PiB_star[sA], 6)}\n\n")
+    #     f.write(f"V*(start B-ball) = {V_star[sB]:.6f}\n")
+    #     f.write(f"pi_A*(B-ball) over {ACTIONS} = {np.round(PiA_star[sB], 6)}\n")
+    #     f.write(f"pi_B*(B-ball) over {ACTIONS} = {np.round(PiB_star[sB], 6)}\n")
+    def all_distinct_starts(H: int, W: int) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+        """Return all (Ay,Ax),(By,Bx) with A!=B (no overlap)."""
+        cells = [(y, x) for y in range(H) for x in range(W)]
+        pairs = []
+        for Ay, Ax in cells:
+            for By, Bx in cells:
+                if (Ay, Ax) != (By, Bx):
+                    pairs.append(((Ay, Ax), (By, Bx)))
+        return pairs
 
-    episodes = 50000
+    episodes_per_start = 200
+    start_pairs = all_distinct_starts(env.H, env.W)
+    rng = np.random.default_rng(0)
+    rng.shuffle(start_pairs)  # random curriculum order
+    episodes = episodes_per_start * len(start_pairs)  # override episodes to ensure equality
+
     learner = NashQLearner(
         gamma=env.gamma,
         alpha0=0.5,
@@ -566,46 +713,67 @@ def main():
     episode_lengths = []
     disc_returns = []
     eps_sched = []
+
+    # --- policy drift trackers ---
+    policy_drift_rows = []
+    prev_snapshot = learner.snapshot_policies()  # baseline snapshot @ ep0
+
+    # optional periodic eval storage (left as-is)
     eval_every = 2000
     eval_points, eval_max_eps, eval_mean_eps = [], [], []
 
-    for ep in range(episodes):
-        s = env.sample_start()
-        learner.start(s)
-        G = 0.0
-        t = 0
-        while True:
-            aA_idx, aB_idx = learner.act()
-            aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
-            ns, r, done = env.step_det_random(s, aA, aB)
-            G += (env.gamma ** t) * r
-            learner.observe(ns, r, done)
-            s = ns
-            t += 1
-            if done or t > 200:
-                learner.end_episode()
-                episode_lengths.append(t)
-                disc_returns.append(G)
-                eps_sched.append(learner.epsA.eps)
-                break
+    ep = 0
+    for (Apos, Bpos) in start_pairs:
+        for _rep in range(episodes_per_start):
+            # start at this (A,B) with random ball each episode
+            Ay, Ax = Apos;
+            By, Bx = Bpos
+            ball = 0 if rng.random() < 0.5 else 1
+            s = State(Ay=Ay, Ax=Ax, By=By, Bx=Bx, ball=ball)
 
-        if (ep + 1) % eval_every == 0:
-            mx, mn = evaluate_against_ground_truth(env, V_star, PiA_star, PiB_star,
-                                                   learner.PiA, learner.PiB)
-            eval_points.append(ep + 1);
-            eval_max_eps.append(mx);
-            eval_mean_eps.append(mn)
-            print(f"Eval @{ep + 1}: max ε={mx:.3e}, mean ε={mn:.3e}; "
-                  f"ΔQ_max_last={learner.episode_deltas[-1]:.3e}, eps≈{learner.epsA.eps:.3f}")
+            learner.start(s)
+            G = 0.0
+            t = 0
+            while True:
+                aA_idx, aB_idx = learner.act()
+                aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
+                ns, r, done = env.step_det_random(s, aA, aB)
+                G += (env.gamma ** t) * r
+                learner.observe(ns, r, done)
+                s = ns
+                t += 1
+                if done or t > 200:
+                    learner.end_episode()
+                    episode_lengths.append(t)
+                    disc_returns.append(G)
+                    eps_sched.append(learner.epsA.eps)
+                    break
 
-        if (ep + 1) % 5000 == 0:
-            last = disc_returns[-5000:] if len(disc_returns) >= 5000 else disc_returns
-            print(f"Episode {ep + 1}: avg discounted return (last block) = {np.mean(last):.4f}, "
-                  f"ΔQ_max_last={learner.episode_deltas[-1]:.3e}, eps≈{learner.epsA.eps:.3f}")
+            # --- policy drift (L1 / TV) between episodes ---
+            drift = learner.policy_drift(prev_snapshot)
+            prev_snapshot = drift["current_snapshot"]
+            policy_drift_rows.append({
+                "episode": ep,
+                "states": drift["agg"]["count"],
+                "l1_A_max": drift["agg"]["l1_A_max"], "l1_A_mean": drift["agg"]["l1_A_mean"],
+                "l1_B_max": drift["agg"]["l1_B_max"], "l1_B_mean": drift["agg"]["l1_B_mean"],
+                "tv_A_max": drift["agg"]["tv_A_max"], "tv_A_mean": drift["agg"]["tv_A_mean"],
+                "tv_B_max": drift["agg"]["tv_B_max"], "tv_B_mean": drift["agg"]["tv_B_mean"],
+            })
+
+            ep += 1
+
+            if (ep % 5000) == 0:
+                last = disc_returns[-5000:] if len(disc_returns) >= 5000 else disc_returns
+                print(f"Episode {ep}: avg discounted return (last block) = {np.mean(last):.4f}, "
+                      f"ΔQ_max_last={learner.episode_deltas[-1]:.3e}, eps≈{learner.epsA.eps:.3f}")
 
     qpath = os.path.join(outdir, "nash_q_tables.pkl")
     save_q_tables_pickle(learner, qpath)
     print(f"Saved Nash-Q tables to {qpath}")
+    # -------- Nash exploitability report (print + save) --------
+    summary, report_path = nash_report_all_states(learner, outdir=outdir, tol=1e-4)
+    print(f"[saved] exploitability report -> {report_path}")
 
     plot_and_save(range(1, len(episode_lengths) + 1), episode_lengths,
                   "Episode Lengths", "Episode", "Steps",
@@ -627,62 +795,198 @@ def main():
     plot_and_save(range(1, len(eps_sched) + 1), eps_sched,
                   "Epsilon Schedule (A)", "Episode", "ε",
                   os.path.join(outdir, "epsilon.png"))
+    # -------- Policy drift outputs --------
+    import csv
+    drift_csv = os.path.join(outdir, "policy_drift.csv")
+    with open(drift_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(policy_drift_rows[0].keys()))
+        w.writeheader()
+        w.writerows(policy_drift_rows)
+    print(f"[saved] {drift_csv}")
 
-    if eval_points:
-        plot_and_save(eval_points, eval_max_eps,
-                      "Exploitability: max ε vs episodes", "Episode", "max ε",
-                      os.path.join(outdir, "exploitability_max.png"))
-        plot_and_save(eval_points, eval_mean_eps,
-                      "Exploitability: mean ε vs episodes", "Episode", "mean ε",
-                      os.path.join(outdir, "exploitability_mean.png"))
+    xs = [r["episode"] for r in policy_drift_rows]
+
+    # TV means
+    plot_and_save(xs, [r["tv_A_mean"] for r in policy_drift_rows],
+                  "Policy Drift — TV mean (A)", "Episode", "TV(A)",
+                  os.path.join(outdir, "policy_drift_tv_mean_A.png"))
+    plot_and_save(xs, [r["tv_B_mean"] for r in policy_drift_rows],
+                  "Policy Drift — TV mean (B)", "Episode", "TV(B)",
+                  os.path.join(outdir, "policy_drift_tv_mean_B.png"))
+
+    # L1 means
+    plot_and_save(xs, [r["l1_A_mean"] for r in policy_drift_rows],
+                  "Policy Drift — L1 mean (A)", "Episode", "L1(A)",
+                  os.path.join(outdir, "policy_drift_l1_mean_A.png"))
+    plot_and_save(xs, [r["l1_B_mean"] for r in policy_drift_rows],
+                  "Policy Drift — L1 mean (B)", "Episode", "L1(B)",
+                  os.path.join(outdir, "policy_drift_l1_mean_B.png"))
+
+    # (Optional) L1 max
+    plot_and_save(xs, [r["l1_A_max"] for r in policy_drift_rows],
+                  "Policy Drift — L1 max (A)", "Episode", "L1_max(A)",
+                  os.path.join(outdir, "policy_drift_l1_max_A.png"))
+    plot_and_save(xs, [r["l1_B_max"] for r in policy_drift_rows],
+                  "Policy Drift — L1 max (B)", "Episode", "L1_max(B)",
+                  os.path.join(outdir, "policy_drift_l1_max_B.png"))
+
+    # if eval_points:
+    #     plot_and_save(eval_points, eval_max_eps,
+    #                   "Exploitability: max ε vs episodes", "Episode", "max ε",
+    #                   os.path.join(outdir, "exploitability_max.png"))
+    #     plot_and_save(eval_points, eval_mean_eps,
+    #                   "Exploitability: mean ε vs episodes", "Episode", "mean ε",
+    #                   os.path.join(outdir, "exploitability_mean.png"))
 
     # ============================================================
-    #        FINAL GREEDY EVALUATION (NO EPSILON; MIXED POLICIES)
+    #   FINAL GREEDY EVAL: all (A,B) starts once; record videos
     # ============================================================
-    print("\n=== Final Greedy Evaluation (sampling from learned mixed policies) ===")
-    np.random.seed(1234)
-    s = env.sample_start()
+    print("\n=== Final Greedy Evaluation: all starts once (ball randomized), with per-start videos ===")
 
-    # Helper: always ensure we have policies for the current state
+    import csv
+
+    # helper: enumerate all distinct non-overlapping starts
+    def all_distinct_starts(H: int, W: int):
+        cells = [(y, x) for y in range(H) for x in range(W)]
+        for Ay, Ax in cells:
+            for By, Bx in cells:
+                if (Ay, Ax) != (By, Bx):
+                    yield (Ay, Ax), (By, Bx)
+
+    # ensure we have solved policies for a state before sampling actions
     def ensure_policy(state: State):
         learner._ensure(state)
         learner._solve(state)
         return learner.PiA[state], learner.PiB[state]
 
-    # ensure for initial state
-    ensure_policy(s)
+    rng_eval = np.random.default_rng(1234)
+    max_steps_eval = 200
+    eval_rows = []
+    a_wins = b_wins = truncs = total_steps = 0
 
-    frames_dir = os.path.join(outdir, "greedy_frames")
-    ensure_dir(frames_dir)
-    step = 0
-    draw_frame(env, s, step, frames_dir)
+    # iterate all distinct (A,B) starts exactly once; randomize ball each time
+    for idx, (Apos, Bpos) in enumerate(all_distinct_starts(env.H, env.W), start=1):
+        Ay, Ax = Apos
+        By, Bx = Bpos
+        ball = 0 if rng_eval.random() < 0.5 else 1
+        s = State(Ay=Ay, Ax=Ax, By=By, Bx=Bx, ball=ball)
+        ensure_policy(s)
 
-    while True:
-        x, y = ensure_policy(s)  # <-- ensure policies exist
-        aA_idx = EpsGreedy(0).sample(x)  # sample from learned mixed policy (no ε)
-        aB_idx = EpsGreedy(0).sample(y)
-        aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
+        # ---- per-start frame dir & filenames ----
+        case_name = f"eval_A({Ay},{Ax})_B({By},{Bx})_ball{'A' if ball == 0 else 'B'}"
+        frames_dir = os.path.join(outdir, case_name)
+        ensure_dir(frames_dir)
 
-        ns, r, done = env.step_det_random(s, aA, aB)
-        step += 1
-        draw_frame(env, ns, step, frames_dir)
+        # draw initial frame
+        step = 0
+        discounted_return = 0.0
+        draw_frame(env, s, step, frames_dir)
 
-        s = ns  # advance
-        if done or step > 200:
-            break
+        # rollout using learned mixed policies (ε = 0)
+        winner = "None"
+        while True:
+            x, y = ensure_policy(s)
+            aA_idx = EpsGreedy(0).sample(x)
+            aB_idx = EpsGreedy(0).sample(y)
+            aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
 
-    out_gif = os.path.join(outdir, "greedy_eval.gif")
-    out_mp4 = os.path.join(outdir, "greedy_eval.mp4")
-    frames_to_gif_mp4(frames_dir, out_gif, out_mp4, fps=3)
+            ns, r, done = env.step_det_random(s, aA, aB)
+            discounted_return += (env.gamma ** step) * r
+            s = ns
+            step += 1
+            draw_frame(env, s, step, frames_dir)
+
+            if done or step >= max_steps_eval:
+                if done:
+                    if r > 0:
+                        winner = "A";
+                        a_wins += 1
+                    elif r < 0:
+                        winner = "B";
+                        b_wins += 1
+                    else:
+                        winner = "Tie"
+                else:
+                    winner = "Trunc";
+                    truncs += 1
+                total_steps += step
+                break
+
+        # make GIF/MP4 per start
+        gif_path = os.path.join(frames_dir, f"{case_name}.gif")
+        mp4_path = os.path.join(frames_dir, f"{case_name}.mp4")
+        try:
+            frames_to_gif_mp4(frames_dir, gif_path, mp4_path, fps=3)
+        except Exception as e:
+            print(f"[video export skipped for {case_name}] {e}")
+            gif_path, mp4_path = "", ""
+
+        # record row
+        eval_rows.append({
+            "idx": idx,
+            "Ay": Ay, "Ax": Ax, "By": By, "Bx": Bx,
+            "ball": ball,  # 0 = A, 1 = B
+            "steps": step,
+            "discounted_return": discounted_return,
+            "winner": winner,
+            "frames_dir": frames_dir,
+            "gif": gif_path,
+            "mp4": mp4_path,
+        })
+
+        if (idx % 100) == 0 or idx == (env.H * env.W * (env.H * env.W - 1)):
+            print(f"  evaluated {idx} starts…")
+
+    # save CSV summary
+    eval_csv = os.path.join(outdir, "eval_all_starts_with_videos.csv")
+    if eval_rows:
+        with open(eval_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(eval_rows[0].keys()))
+            w.writeheader();
+            w.writerows(eval_rows)
+        print(f"[saved] per-start eval summary -> {eval_csv}")
+
+    # aggregate prints & plots
+    n = len(eval_rows)
+    avg_steps = total_steps / max(1, n)
+    print(f"Final eval summary over {n} starts:")
+    print(f"  A wins: {a_wins} | B wins: {b_wins} | truncations: {truncs}")
+    print(f"  avg steps per start: {avg_steps:.2f}")
+
+    try:
+        winners_list = [r["winner"] for r in eval_rows]
+        labels, counts = np.unique(winners_list, return_counts=True)
+
+        plt.figure()
+        plt.bar(labels, counts)
+        plt.title("Final Eval — Winner counts over all starts")
+        plt.xlabel("Outcome");
+        plt.ylabel("Count")
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "final_eval_winner_counts.png"))
+        plt.close()
+
+        plt.figure()
+        plt.hist([r["steps"] for r in eval_rows], bins=20)
+        plt.title("Final Eval — Steps per start (histogram)")
+        plt.xlabel("Steps");
+        plt.ylabel("Frequency")
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "final_eval_steps_hist.png"))
+        plt.close()
+    except Exception as e:
+        print(f"[final eval plotting skipped] {e}")
+
+    env.close()
 
     with open(os.path.join(outdir, "training_summary.txt"), "w") as f:
         f.write(f"Episodes: {episodes}\n")
         f.write(f"Final epsilon ~ {eps_sched[-1] if eps_sched else 'NA'}\n")
-        if eval_points:
-            f.write(f"Final periodic exploitability: max={eval_max_eps[-1]:.6e}, mean={eval_mean_eps[-1]:.6e}\n")
+        # if eval_points:
+        #     f.write(f"Final periodic exploitability: max={eval_max_eps[-1]:.6e}, mean={eval_mean_eps[-1]:.6e}\n")
         f.write(f"Saved Q tables: {qpath}\n")
-        f.write(f"Final eval video (GIF): {out_gif}\n")
-        f.write(f"Final eval video (MP4): {out_mp4}\n")
+        f.write(f"Nash exploitability report: {report_path}\n")
+        f.write(f"Policy drift CSV: {drift_csv}\n")
 
 
 if __name__ == "__main__":

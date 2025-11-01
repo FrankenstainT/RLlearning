@@ -790,7 +790,7 @@ if __name__ == "__main__":
                                      manhattan(pe[0], pe[1])))
 
     # Choose exactly how many episodes per start so every start is trained equally
-    EPISODES_PER_START = 100
+    EPISODES_PER_START = 200
     NUM_PAIRS = len(start_pairs)
     num_episodes = EPISODES_PER_START * NUM_PAIRS  # override to ensure equality
 
@@ -1044,54 +1044,106 @@ if __name__ == "__main__":
     plt.close()
 
     # ============================================================
-    #                FINAL EVALUATION (GREEDY)
+    #                FINAL EVALUATION (GREEDY, ALL STARTS)
     # ============================================================
-    print("\n=== Running Final Evaluation (Nash-Q) ===")
-    eval_episodes = 1
-    for ep in range(eval_episodes):
-        # new RNGs for eval episode (stable & separate from training)
-        env_seed = 2_000_003 + ep
-        pursuer_seed = 3_000_001 + ep
-        evader_seed = 3_100_001 + ep
+    print("\n=== Running Final Evaluation (Nash-Q) over ALL non-overlapping starts ===")
 
-        obs, infos = env.reset(seed=env_seed)
-        nash_learner.eps_p.set_rng(np.random.default_rng(pursuer_seed))
-        nash_learner.eps_e.set_rng(np.random.default_rng(evader_seed))
+    import csv
+    eval_outdir = os.path.join("stat", "eval_traces")
+    os.makedirs(eval_outdir, exist_ok=True)
 
+    # Rebuild the evaluation start set from current env (no overlap)
+    valid_cells = env.valid_cells()
+    eval_pairs = [(p, e) for p in valid_cells for e in valid_cells if p != e]
+
+    # Helper to ensure policies exist before sampling actions
+    def ensure_policy_ready(state_key):
+        nash_learner._ensure_state(state_key)
+        nash_learner._solve_policies(state_key)
+
+    # Per-start evaluation summary rows
+    eval_rows = []
+
+    for idx, (p0, e0) in enumerate(eval_pairs, start=1):
+        # Reset to the chosen positions
+        env_seed = 2_000_000 + idx  # stable but distinct
+        obs, infos = env.reset(
+            seed=env_seed,
+            options={"start_pos": {"pursuer": p0, "evader": e0}}
+        )
+
+        # Prepare folder name that encodes initial positions
+        case_name = f"P({p0[0]},{p0[1]})__E({e0[0]},{e0[1]})"
+        case_dir = os.path.join(eval_outdir, case_name)
+        os.makedirs(case_dir, exist_ok=True)
+
+        # Make sure policies for the initial state are solved
+        s_key = env.state_key()
+        nash_learner.start_state(s_key)  # ensures policies ready
+
+        # Draw initial frame
         step = 0
-        total_rewards = {"pursuer": 0.0, "evader": 0.0}
+        total_r_p, total_r_e = 0.0, 0.0
+        env.render(save_dir=case_dir, episode=0, step=step, live=False)
 
-        s = env.state_key()
-        nash_learner.start_state(s)  # ensures policies ready
-
-        env.render(episode=num_episodes + ep, step=step, live=False)
+        # Rollout greedily from learned mixed strategies (sample from π; ε=0 behavior)
         while True:
-            nash_learner._ensure_state(nash_learner.state)
-
-            # greedy evaluation (use deterministic=True for pure argmax, or False to sample)
             x, y, _ = nash_learner._solve_policies(nash_learner.state)
             ap = nash_learner.eps_p.select_greedy_action(x, deterministic=False)
             ae = nash_learner.eps_e.select_greedy_action(y, deterministic=False)
             actions_dict = {"pursuer": ap, "evader": ae}
 
             next_obs, rewards, terminations, truncations, infos = env.step(actions_dict)
-            total_rewards["pursuer"] += rewards["pursuer"]
-            total_rewards["evader"] += rewards["evader"]
+            total_r_p += rewards["pursuer"]
+            total_r_e += rewards["evader"]
 
-            env.render(episode=num_episodes + ep, step=step + 1, live=False)
+            # Render next frame
+            env.render(save_dir=case_dir, episode=0, step=step + 1, live=False)
 
-            next_s = env.state_key()
-            nash_learner._ensure_state(next_s)
-            # advance internal pointer (no learning during eval)
-            nash_learner.state = next_s
+            # Advance internal pointer (no learning during eval)
+            next_s_key = env.state_key()
+            nash_learner._ensure_state(next_s_key)
+            nash_learner.state = next_s_key
 
             step += 1
             if any(terminations.values()) or any(truncations.values()):
                 winner = infos["pursuer"]["winner"]
-                print(f"Eval Episode {ep}: winner={winner}, steps={step}, "
-                      f"R_p={total_rewards['pursuer']:.2f}, R_e={total_rewards['evader']:.2f}")
                 break
 
-        save_episode_animation(num_episodes + ep, save_dir="renders", fps=2)
+        # Build videos for this start (GIF & MP4 placed inside the same folder)
+        try:
+            save_episode_animation(0, save_dir=case_dir, fps=2)
+            gif_path = os.path.join(case_dir, "episode_00000.gif")
+            mp4_path = os.path.join(case_dir, "episode_00000.mp4")
+        except Exception as e:
+            print(f"[video export skipped] {case_name}: {e}")
+            gif_path = ""
+            mp4_path = ""
+
+        # Record row
+        eval_rows.append({
+            "index": idx,
+            "pursuer_y": p0[0], "pursuer_x": p0[1],
+            "evader_y": e0[0], "evader_x": e0[1],
+            "steps": step,
+            "winner": winner,
+            "R_pursuer": total_r_p,
+            "R_evader": total_r_e,
+            "folder": case_dir,
+            "gif": gif_path,
+            "mp4": mp4_path,
+        })
+
+        if idx % 50 == 0 or idx == len(eval_pairs):
+            print(f"  evaluated {idx}/{len(eval_pairs)} starts…")
+
+    # Save CSV summary
+    csv_path = os.path.join(eval_outdir, "eval_all_starts_summary.csv")
+    if eval_rows:
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(eval_rows[0].keys()))
+            w.writeheader(); w.writerows(eval_rows)
+        print(f"[saved] per-start eval summary -> {csv_path}")
 
     env.close()
+
