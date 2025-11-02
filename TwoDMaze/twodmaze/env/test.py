@@ -1,122 +1,88 @@
-# soccer.py
-import os
-import math
-import random
-from dataclasses import dataclass
-from typing import Dict, Tuple, List
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import numpy as np
-from scipy.optimize import linprog
-import matplotlib.pyplot as plt
-import imageio.v2 as imageio
+import sympy as sp
 
+def main():
+    # ----- symbols -----
+    pr, ps, pd, qd = sp.symbols('p_r p_s p_d q_d', real=True)
+    # We'll eliminate p_d using the simplex constraint later: p_d = 1 - p_r - p_s
 
-def solve_both_policies_one_lp(M: np.ndarray, jitter=1e-8, max_retries=2):
-    """
-    Robust one-LP saddle solver:
-    maximize v
-      s.t. v <= x^T M[:,j] (∀j),  M[i,:] y <= v (∀i),
-           1^T x = 1, x>=0, 1^T y = 1, y>=0
-    Returns (x, y, v) for the *original* (unscaled) M.
-    """
-    M = np.asarray(M, float)
-    # sanitize
-    if not np.all(np.isfinite(M)):
-        M = np.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
+    # ----- v_a(q_d) in your final reduced form -----
+    # v_a = [ 0.5*pd + (1.5*pr + ps - 0.5)*qd ] / [ 1 + pr - ps + 0.5*pd + (0.5*pr + 3*ps - 1.5)*qd ]
+    va = (sp.Rational(1,2)*pd + (sp.Rational(3,2)*pr + ps - sp.Rational(1,2))*qd) / \
+         (1 + pr - ps + sp.Rational(1,2)*pd + (sp.Rational(1,2)*pr + 3*ps - sp.Rational(3,2))*qd)
 
-    # center & scale for conditioning (affine-invariant policies)
-    mu = float(np.mean(M))
-    Ms = M - mu
-    s = float(np.max(np.abs(Ms)))
-    if s < 1e-12:
-        # essentially constant matrix -> any x,y; value = that constant
-        m, n = M.shape
-        x = np.ones(m) / m
-        y = np.ones(n) / n
-        v = mu
-        return x, y, v
-    Ms /= s
+    # Optional: eliminate pd via constraint p_r + p_s + p_d = 1
+    subs_simplex = {pd: 1 - pr - ps}
+    va_s = sp.simplify(va.subs(subs_simplex))
 
-    def _solve_raw(A):
-        m, n = A.shape
-        num = m + n + 1
-        xs = slice(0, m);
-        ys = slice(m, m + n);
-        vidx = m + n
+    # ----- derivatives wrt q_d -----
+    d1 = sp.simplify(sp.diff(va_s, qd))
+    d2 = sp.simplify(sp.diff(va_s, qd, 2))
 
-        c = np.zeros(num);
-        c[vidx] = -1.0
-        A_ub = [];
-        b_ub = []
+    # Extract the clean “numerator over denominator^2” form for the first derivative:
+    # d1 = (num1) / (den1)
+    num1 = sp.simplify(sp.together(d1).as_numer_denom()[0])
+    den1 = sp.simplify(sp.together(d1).as_numer_denom()[1])
 
-        # v <= x^T A[:,j]
-        for j in range(n):
-            row = np.zeros(num)
-            row[xs] = -A[:, j]
-            row[vidx] = 1.0
-            A_ub.append(row);
-            b_ub.append(0.0)
+    # It’s often useful to factor them:
+    num1_f = sp.factor(num1)
+    den1_f = sp.factor(den1)
 
-        # A[i,:] y <= v
-        for i in range(m):
-            row = np.zeros(num)
-            row[ys] = A[i, :]
-            row[vidx] = -1.0
-            A_ub.append(row);
-            b_ub.append(0.0)
+    # Also show the “affine denominator” of v_a, for curvature sign:
+    # v_a = (A + B*qd) / (C + D*qd)  => D = 0.5*pr + 3*ps - 1.5 (after substituting pd)
+    # Let’s extract A,B,C,D directly to confirm:
+    # Build A,B,C,D from the pre-substitution form, then substitute
+    A = sp.Rational(1,2)*pd
+    B = sp.Rational(3,2)*pr + ps - sp.Rational(1,2)
+    C = 1 + pr - ps + sp.Rational(1,2)*pd
+    D = sp.Rational(1,2)*pr + 3*ps - sp.Rational(3,2)
 
-        A_ub = np.vstack(A_ub);
-        b_ub = np.array(b_ub)
-        A_eq = np.zeros((2, num));
-        A_eq[0, xs] = 1.0;
-        A_eq[1, ys] = 1.0
-        b_eq = np.array([1.0, 1.0])
-        bounds = [(0, None)] * m + [(0, None)] * n + [(None, None)]
+    A_s = sp.simplify(A.subs(subs_simplex))
+    B_s = sp.simplify(B.subs(subs_simplex))
+    C_s = sp.simplify(C.subs(subs_simplex))
+    D_s = sp.simplify(D.subs(subs_simplex))
 
-        res = linprog(c, A_ub=A_ub, b_ub=b_ub,
-                      A_eq=A_eq, b_eq=b_eq,
-                      bounds=bounds, method="highs")
-        return res
+    # Pretty print results
+    sp.init_printing(use_unicode=True)
 
-    # try solve, with a couple of jittered retries if needed
-    A = Ms
-    for attempt in range(max_retries + 1):
-        res = _solve_raw(A)
-        if res.status == 0 and np.isfinite(res.fun):
-            z = res.x
-            m, n = Ms.shape
-            x = np.clip(z[:m], 0, None);
-            y = np.clip(z[m:m + n], 0, None);
-            v = float(z[m + n])
-            sx, sy = x.sum(), y.sum()
-            x = x / sx if sx > 0 else np.ones(m) / m
-            y = y / sy if sy > 0 else np.ones(n) / n
-            # rescale value back
-            v = v * s + mu
-            return x, y, v
-        # add tiny jitter and retry
-        A = Ms + np.random.default_rng().normal(scale=jitter, size=Ms.shape)
+    print("\n=== v_a(q_d) with p_d eliminated (p_d = 1 - p_r - p_s) ===")
+    sp.pprint(va_s)
 
-    # last resort: return uniform to keep training stable
-    m, n = M.shape
-    x = np.ones(m) / m
-    y = np.ones(n) / n
-    v = float(np.mean(M))  # harmless placeholder
-    return x, y, v
+    print("\n=== dv_a/dq_d (simplified) ===")
+    sp.pprint(d1)
 
+    print("\n--- numerator of dv_a/dq_d (factored) ---")
+    sp.pprint(num1_f)
+
+    print("\n--- denominator of dv_a/dq_d (factored) ---")
+    sp.pprint(den1_f)
+
+    print("\n=== d^2 v_a / dq_d^2 (simplified) ===")
+    sp.pprint(d2)
+
+    print("\n=== Affine coefficients A,B,C,D in v_a = (A + B q_d) / (C + D q_d) (after substitution) ===")
+    print("A = "); sp.pprint(A_s)
+    print("B = "); sp.pprint(B_s)
+    print("C = "); sp.pprint(C_s)
+    print("D = "); sp.pprint(D_s)
+
+    # Optional: verify the closed-form slope claimed earlier:
+    # Expected: dv/dq = [4*pr*(1+pr)] / [ ( pr - 3*ps + 3 + (pr + 6*ps - 3)*qd )^2 ]
+    # Build the RHS and check symbolic equality (up to simplification).
+    rhs = (4*pr*(1+pr)) / ( (pr - 3*ps + 3) + (pr + 6*ps - 3)*qd )**2
+    check_eq = sp.simplify(d1 - rhs)
+    print("\n=== Check dv/dq vs claimed closed form (should simplify to 0) ===")
+    sp.pprint(check_eq)
+
+    # Small numeric probe (kept symbolic overall, but useful to see numbers):
+    print("\n=== Numeric sanity check at pr=0.3, ps=0.4 (so pd=0.3), qd=0.2 ===")
+    probe_vals = {pr: 0.3, ps: 0.4, qd: 0.2}
+    print("v_a =", float(va_s.subs(probe_vals)))
+    print("dv/dq =", float(d1.subs(probe_vals)))
+    print("d2v/dq2 =", float(d2.subs(probe_vals)))
+    print("D =", float(D_s.subs(probe_vals)), "(sign of D controls concavity: concave if D>0, convex if D<0)")
 
 if __name__ == "__main__":
-    np.random.seed(7)
-    M = np.random.uniform(-5, 10, size=(4, 4))  # 4x4 example
-    # M = np.zeros((4,4))
-    x, y, v = solve_both_policies_one_lp(M)
-    print("M:\n", np.round(M, 2))
-    print("x:", np.round(x, 6))
-    print("y:", np.round(y, 6))
-    print("v*:", round(v, 6))
-
-    # Saddle checks
-    col_vals = M.T @ x  # E_x[M[:,j]] for each column j
-    row_vals = M @ y  # E_y[M[i,:]] for each row i
-    print("min_j E_x[M[:,j]] =", round(col_vals.min(), 6))
-    print("max_i E_y[M[i,:]] =", round(row_vals.max(), 6))
+    main()

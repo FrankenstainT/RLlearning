@@ -72,12 +72,13 @@ class MarkovSoccer:
     Reward +1 for A scoring, -1 for B scoring; discount gamma.
     """
 
-    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0):
+    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0,phi_coeff: float = 0.05):
         self.H, self.W = H, W
         self.gamma = float(gamma)
         self.rng = random.Random(seed)
         # canonical start positions; ball random each episode
-        self._start_no_ball = State(Ay=2, Ax=1, By=1, Bx=3, ball=0)
+        self.phi_coeff = float(phi_coeff)
+        #self._start_no_ball = State(Ay=2, Ax=1, By=1, Bx=3, ball=0)
 
         # enumerate all non-terminal distinct-cell states
         self.states: List[State] = []
@@ -93,6 +94,16 @@ class MarkovSoccer:
 
     def in_bounds(self, y, x) -> bool:
         return 0 <= y < self.H and 0 <= x < self.W
+
+    def potential(self, s: State) -> float:
+        dA = self.W - 1 - s.Ax  # A’s horizontal distance to right edge
+        dB = s.Bx  # B’s horizontal distance to left edge
+        if s.ball == 0:
+            # A has ball: reward A getting closer (Φ more positive when closer)
+            return -self.phi_coeff * float(dA)
+        else:
+            # B has ball: *penalize A* when B gets closer (Φ more negative when B closer)
+            return +self.phi_coeff * float(dB)
 
     # ----- single-player tentative move (with walls) -----
     def _apply_single(self, y, x, a):
@@ -163,7 +174,9 @@ class MarkovSoccer:
         ns = State(A_new_y, A_new_x, B_new_y, B_new_x, new_ball)
         # sanity: never same cell
         assert (ns.Ay, ns.Ax) != (ns.By, ns.Bx), "Invariant violated: same-cell created"
-        return ns, 0.0, False
+        # potential-based shaping (preserves optimal policies)
+        r += self.gamma * self.potential(ns) - self.potential(s)
+        return ns, r, False
 
     # ----- stochastic one-step: random order 50/50 -----
     def step_det_random(self, s: State, aA: str, aB: str):
@@ -172,11 +185,11 @@ class MarkovSoccer:
         else:
             return self.step_seq(s, aA, aB, "BA")
 
-    def sample_start(self) -> State:
-        # same positions; ball goes to A or B at random
-        ball = 0 if self.rng.random() < 0.5 else 1
-        return State(self._start_no_ball.Ay, self._start_no_ball.Ax,
-                     self._start_no_ball.By, self._start_no_ball.Bx, ball)
+    # def sample_start(self) -> State:
+    #     # same positions; ball goes to A or B at random
+    #     ball = 0 if self.rng.random() < 0.5 else 1
+    #     return State(self._start_no_ball.Ay, self._start_no_ball.Ax,
+    #                  self._start_no_ball.By, self._start_no_ball.Bx, ball)
 
 
 # ============================================================
@@ -365,7 +378,7 @@ class NashQLearner:
         self.PiB: Dict[State, np.ndarray] = {}
         self.vis: Dict[State, Dict[Tuple[int, int], int]] = {}
 
-        self.state_visits: Dict[State, int] = {}  # <---- NEW: per-state visit counter
+        self.state_visits: Dict[State, int] = {}
         self.dirty: set = set()
 
         self.state: State = None  # type: ignore
@@ -388,7 +401,7 @@ class NashQLearner:
             self.PiA[s] = np.ones(len(ACTIONS)) / len(ACTIONS)
             self.PiB[s] = np.ones(len(ACTIONS)) / len(ACTIONS)
             self.vis[s] = {(i, j): 0 for i in range(len(ACTIONS)) for j in range(len(ACTIONS))}
-            self.state_visits.setdefault(s, 0)  # <--- NEW
+            self.state_visits.setdefault(s, 0)
             self.dirty.add(s)
 
     def _matrix_from_Q(self, s: State) -> np.ndarray:
@@ -729,17 +742,17 @@ def main():
     starts_with_ball.sort(key=lambda t: owner_goal_distance(env, t[0], t[1], t[2]))
 
     # how many episodes for EACH (A,B,ball) triple
-    EPISODES_PER_TRIPLE = 1000  # <-- set what you want (even across balls)
+    EPISODES_PER_TRIPLE = 1#000  #  (even across balls)
     episodes = EPISODES_PER_TRIPLE * len(starts_with_ball)
 
     learner = NashQLearner(
         gamma=env.gamma,
-        alpha0=0.5,
-        alpha_power=0.6,
-        eps_init=0.3,
-        eps_final=0.02,
+        alpha0=0.6,
+        alpha_power=0.4,
+        eps_init=0.6,
+        eps_final=0.1,
         episodes=episodes,
-        eps_power=0.6,  # ε(s) ∝ (1+visits)^-0.6
+        eps_power=0.25,  # ε(s) ∝ (1+visits)^-0.6
     )
 
     episode_lengths = []
@@ -751,7 +764,6 @@ def main():
     prev_snapshot = learner.snapshot_policies()
 
     ep = 0
-    rng = np.random.default_rng(0)
 
     for (Apos, Bpos, ball) in starts_with_ball:
         for _rep in range(EPISODES_PER_TRIPLE):
@@ -888,83 +900,77 @@ def main():
         learner._solve(state)
         return learner.PiA[state], learner.PiB[state]
 
-    rng_eval = np.random.default_rng(1234)
-    max_steps_eval = 200
+
+    max_steps_eval = 100
     eval_rows = []
     a_wins = b_wins = truncs = total_steps = 0
 
-    # iterate all distinct (A,B) starts exactly once; randomize ball each time
-    for idx, (Apos, Bpos) in enumerate(all_distinct_starts(env.H, env.W), start=1):
+    idx = 0
+    for (Apos, Bpos) in all_distinct_starts(env.H, env.W):
         Ay, Ax = Apos
         By, Bx = Bpos
-        ball = 0 if rng_eval.random() < 0.5 else 1
-        s = State(Ay=Ay, Ax=Ax, By=By, Bx=Bx, ball=ball)
-        ensure_policy(s)
+        for ball in (0, 1):  # <-- evaluate both A-ball and B-ball
+            idx += 1
+            s = State(Ay=Ay, Ax=Ax, By=By, Bx=Bx, ball=ball)
+            ensure_policy(s)
 
-        # ---- per-start frame dir & filenames ----
-        case_name = f"eval_A({Ay},{Ax})_B({By},{Bx})_ball{'A' if ball == 0 else 'B'}"
-        frames_dir = os.path.join(outdir, case_name)
-        ensure_dir(frames_dir)
+            case_name = f"eval_A({Ay},{Ax})_B({By},{Bx})_ball{'A' if ball == 0 else 'B'}"
+            frames_dir = os.path.join(outdir, case_name)
+            ensure_dir(frames_dir)
 
-        # draw initial frame
-        step = 0
-        discounted_return = 0.0
-        draw_frame(env, s, step, frames_dir)
-
-        # rollout using learned mixed policies (ε = 0)
-        winner = "None"
-        while True:
-            x, y = ensure_policy(s)
-            aA_idx = EpsGreedy(0).sample(x)
-            aB_idx = EpsGreedy(0).sample(y)
-            aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
-
-            ns, r, done = env.step_det_random(s, aA, aB)
-            discounted_return += (env.gamma ** step) * r
-            s = ns
-            step += 1
+            # rollout (ε = 0, sample from learned mixed policies)
+            step = 0
+            discounted_return = 0.0
             draw_frame(env, s, step, frames_dir)
 
-            if done or step >= max_steps_eval:
-                if done:
-                    if r > 0:
-                        winner = "A";
-                        a_wins += 1
-                    elif r < 0:
-                        winner = "B";
-                        b_wins += 1
+            winner = "None"
+            while True:
+                x, y = ensure_policy(s)
+                aA_idx = EpsGreedy(0).sample(x)
+                aB_idx = EpsGreedy(0).sample(y)
+                aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
+
+                ns, r, done = env.step_det_random(s, aA, aB)
+                discounted_return += (env.gamma ** step) * r
+                s = ns
+                step += 1
+                draw_frame(env, s, step, frames_dir)
+
+                if done or step >= max_steps_eval:
+                    if done:
+                        if r > 0:
+                            winner = "A"; a_wins += 1
+                        elif r < 0:
+                            winner = "B"; b_wins += 1
+                        else:
+                            winner = "Tie"
                     else:
-                        winner = "Tie"
-                else:
-                    winner = "Trunc";
-                    truncs += 1
-                total_steps += step
-                break
+                        winner = "Trunc"; truncs += 1
+                    total_steps += step
+                    break
 
-        # make GIF/MP4 per start
-        gif_path = os.path.join(frames_dir, f"{case_name}.gif")
-        mp4_path = os.path.join(frames_dir, f"{case_name}.mp4")
-        try:
-            frames_to_gif_mp4(frames_dir, gif_path, mp4_path, fps=3)
-        except Exception as e:
-            print(f"[video export skipped for {case_name}] {e}")
-            gif_path, mp4_path = "", ""
+            gif_path = os.path.join(frames_dir, f"{case_name}.gif")
+            mp4_path = os.path.join(frames_dir, f"{case_name}.mp4")
+            try:
+                frames_to_gif_mp4(frames_dir, gif_path, mp4_path, fps=3)
+            except Exception as e:
+                print(f"[video export skipped for {case_name}] {e}")
+                gif_path, mp4_path = "", ""
 
-        # record row
-        eval_rows.append({
-            "idx": idx,
-            "Ay": Ay, "Ax": Ax, "By": By, "Bx": Bx,
-            "ball": ball,  # 0 = A, 1 = B
-            "steps": step,
-            "discounted_return": discounted_return,
-            "winner": winner,
-            "frames_dir": frames_dir,
-            "gif": gif_path,
-            "mp4": mp4_path,
-        })
+            eval_rows.append({
+                "idx": idx,
+                "Ay": Ay, "Ax": Ax, "By": By, "Bx": Bx,
+                "ball": ball,  # 0 = A, 1 = B
+                "steps": step,
+                "discounted_return": discounted_return,
+                "winner": winner,
+                "frames_dir": frames_dir,
+                "gif": gif_path,
+                "mp4": mp4_path,
+            })
 
-        if (idx % 100) == 0 or idx == (env.H * env.W * (env.H * env.W - 1)):
-            print(f"  evaluated {idx} starts…")
+            if (idx % 100) == 0:
+                print(f"  evaluated {idx} start-cases…")
 
     # save CSV summary
     eval_csv = os.path.join(outdir, "eval_all_starts_with_videos.csv")
