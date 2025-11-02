@@ -5,12 +5,15 @@ import random
 n = 4
 actions = [f"A{i}" for i in range(n)]
 Q = {}
-random.seed(42)
-for a1 in actions:
-    for a2 in actions:
-        #Q[(a1, a2)] = round(random.uniform(-5, 10), 2)
-        Q[(a1, a2)] = 0
-
+# random.seed(42)
+# for a1 in actions:
+#     for a2 in actions:
+#         #Q[(a1, a2)] = round(random.uniform(-5, 10), 2)
+#         Q[(a1, a2)] = 0
+import numpy as np
+np.random.seed(7)
+Q = np.random.uniform(-5, 10, size=(4, 4))  # 4x4 example
+Q = {(actions[i], actions[j]): float(Q[i, j]) for i in range(n) for j in range(n)}
 # Define LP
 pi = pulp.LpVariable.dicts("pi", range(n), lowBound=0)
 v = pulp.LpVariable("v")

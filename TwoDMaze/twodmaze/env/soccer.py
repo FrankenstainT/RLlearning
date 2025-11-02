@@ -54,6 +54,16 @@ class State:
     ball: int  # 0 if A has ball, 1 if B has ball
 
 
+def owner_goal_distance(env: "MarkovSoccer", Apos, Bpos, ball: int) -> int:
+    """
+    Heuristic distance from the ball owner to their scoring edge.
+    For A (ball==0): horizontal distance to right edge: W-1 - Ax
+    For B (ball==1): horizontal distance to left edge: Bx
+    """
+    (Ay, Ax), (By, Bx) = Apos, Bpos
+    return (env.W - 1 - Ax) if ball == 0 else Bx
+
+
 class MarkovSoccer:
     """
     4x5 grid; **A scores on the right, B scores on the left**. Zero-sum.
@@ -310,48 +320,52 @@ def shapley_value_iteration(env: MarkovSoccer, tol: float = 1e-10, max_iter: int
 # ============================================================
 
 class EpsGreedy:
-    def __init__(self, eps: float): self.eps = float(eps)
+    def __init__(self, eps: float):
+        self.eps = float(eps)
 
-    def pick(self, p: np.ndarray) -> int:
-        p = np.asarray(p, float);
-        p = np.clip(p, 0, None);
+    def pick(self, p: np.ndarray, eps: float = None) -> int:
+        """ε-greedy pick; if eps is given use it, else fall back to self.eps."""
+        p = np.asarray(p, float)
+        p = np.clip(p, 0, None)
         ps = p.sum()
         p = p / ps if ps > 0 else np.ones_like(p) / len(p)
-        if np.random.rand() < self.eps:
+        use_eps = self.eps if eps is None else float(eps)
+        if np.random.rand() < use_eps:
             return int(np.random.randint(len(p)))
         return int(np.random.choice(len(p), p=p))
 
     def sample(self, p: np.ndarray) -> int:
-        p = np.asarray(p, float);
-        p = np.clip(p, 0, None);
+        """Pure sampling from a mixed policy (no exploration)."""
+        p = np.asarray(p, float)
+        p = np.clip(p, 0, None)
         ps = p.sum()
         p = p / ps if ps > 0 else np.ones_like(p) / len(p)
         return int(np.random.choice(len(p), p=p))
 
 
 class NashQLearner:
-    """
-    Single Q for A’s payoff. At each state, build a 5x5 matrix from Q[s],
-    solve (x,y,v) with one LP, TD-update Q(s,aA,aB) toward r + γ V(s').
-    Per-(s,aA,aB) **count-based Robbins–Monro step-size**:
-        α_t(s,a) = α0 / (1 + N_t(s,a))^p,  with 0.5 < p ≤ 1
-    """
-
     def __init__(self, gamma=0.9, alpha0=0.5, alpha_power=0.6,
-                 eps_init=0.3, eps_final=0.02, episodes=50000):
+                 eps_init=0.3, eps_final=0.02, episodes=50000,
+                 eps_power=0.6):
         self.gamma = float(gamma)
         self.alpha0 = float(alpha0)
         self.alpha_power = float(alpha_power)
 
-        self.epsA = EpsGreedy(eps_init)
-        self.epsB = EpsGreedy(eps_init)
-        self.eps_decay = (max(eps_final, 1e-6) / max(eps_init, 1e-6)) ** (1.0 / max(1, episodes))
+        # ---- state-adaptive ε(s) params ----
+        self.eps_init = float(eps_init)
+        self.eps_min = float(eps_final)
+        self.eps_power = float(eps_power)  # 0.5~1.0 typical
+
+        self.epsA = EpsGreedy(self.eps_init)
+        self.epsB = EpsGreedy(self.eps_init)
 
         self.Q: Dict[State, Dict[Tuple[int, int], float]] = {}
         self.V: Dict[State, float] = {}
         self.PiA: Dict[State, np.ndarray] = {}
         self.PiB: Dict[State, np.ndarray] = {}
         self.vis: Dict[State, Dict[Tuple[int, int], int]] = {}
+
+        self.state_visits: Dict[State, int] = {}  # <---- NEW: per-state visit counter
         self.dirty: set = set()
 
         self.state: State = None  # type: ignore
@@ -362,6 +376,11 @@ class NashQLearner:
 
         self.q_clip = 1.0 / max(1e-6, (1.0 - self.gamma))
 
+    def _epsilon_for_state(self, s: State) -> float:
+        n = self.state_visits.get(s, 0)
+        # ε(s) = max(ε_min, ε_init / (1+n)^eps_power)
+        return max(self.eps_min, self.eps_init / ((1.0 + n) ** self.eps_power))
+
     def _ensure(self, s: State):
         if s not in self.Q:
             self.Q[s] = {(i, j): 0.0 for i in range(len(ACTIONS)) for j in range(len(ACTIONS))}
@@ -369,6 +388,7 @@ class NashQLearner:
             self.PiA[s] = np.ones(len(ACTIONS)) / len(ACTIONS)
             self.PiB[s] = np.ones(len(ACTIONS)) / len(ACTIONS)
             self.vis[s] = {(i, j): 0 for i in range(len(ACTIONS)) for j in range(len(ACTIONS))}
+            self.state_visits.setdefault(s, 0)  # <--- NEW
             self.dirty.add(s)
 
     def _matrix_from_Q(self, s: State) -> np.ndarray:
@@ -396,12 +416,15 @@ class NashQLearner:
         self.state = s
         self._ensure(s)
         self._solve(s)
+        # entering a state counts as a visit for ε(s)
+        self.state_visits[s] = self.state_visits.get(s, 0) + 1  # <--- NEW
 
     def act(self) -> Tuple[int, int]:
         s = self.state
         x, y, _ = self._solve(s)
-        aA = self.epsA.pick(x)
-        aB = self.epsB.pick(y)
+        eps_s = self._epsilon_for_state(s)  # <--- state-adaptive epsilon
+        aA = self.epsA.pick(x, eps=eps_s)
+        aB = self.epsB.pick(y, eps=eps_s)
         self.last_pair = (aA, aB)
         return aA, aB
 
@@ -431,12 +454,12 @@ class NashQLearner:
 
         self.dirty.add(s)
         self.state = s_next
+        # count visit for next state as we arrive there
+        self.state_visits[s_next] = self.state_visits.get(s_next, 0) + 1
 
     def end_episode(self):
         self.episode_deltas.append(self._ep_max_delta)
         self._ep_max_delta = 0.0
-        self.epsA.eps = max(self.epsA.eps * self.eps_decay, 0.02)
-        self.epsB.eps = max(self.epsB.eps * self.eps_decay, 0.02)
 
     def snapshot_policies(self):
         """
@@ -695,11 +718,19 @@ def main():
                     pairs.append(((Ay, Ax), (By, Bx)))
         return pairs
 
-    episodes_per_start = 200
-    start_pairs = all_distinct_starts(env.H, env.W)
-    rng = np.random.default_rng(0)
-    rng.shuffle(start_pairs)  # random curriculum order
-    episodes = episodes_per_start * len(start_pairs)  # override episodes to ensure equality
+    # ----- curriculum: each (A,B) trained with ball=A and ball=B equally -----
+    pairs = list(all_distinct_starts(env.H, env.W))  # (Apos, Bpos)
+    starts_with_ball = []
+    for Apos, Bpos in pairs:
+        starts_with_ball.append((Apos, Bpos, 0))  # ball to A
+        starts_with_ball.append((Apos, Bpos, 1))  # ball to B
+
+    # sort ascending by distance(owner → goal)
+    starts_with_ball.sort(key=lambda t: owner_goal_distance(env, t[0], t[1], t[2]))
+
+    # how many episodes for EACH (A,B,ball) triple
+    EPISODES_PER_TRIPLE = 1000  # <-- set what you want (even across balls)
+    episodes = EPISODES_PER_TRIPLE * len(starts_with_ball)
 
     learner = NashQLearner(
         gamma=env.gamma,
@@ -707,31 +738,31 @@ def main():
         alpha_power=0.6,
         eps_init=0.3,
         eps_final=0.02,
-        episodes=episodes
+        episodes=episodes,
+        eps_power=0.6,  # ε(s) ∝ (1+visits)^-0.6
     )
 
     episode_lengths = []
     disc_returns = []
-    eps_sched = []
+    eps_sched = []  # we'll log ε of the initial state each episode (for plots)
 
     # --- policy drift trackers ---
     policy_drift_rows = []
-    prev_snapshot = learner.snapshot_policies()  # baseline snapshot @ ep0
-
-    # optional periodic eval storage (left as-is)
-    eval_every = 2000
-    eval_points, eval_max_eps, eval_mean_eps = [], [], []
+    prev_snapshot = learner.snapshot_policies()
 
     ep = 0
-    for (Apos, Bpos) in start_pairs:
-        for _rep in range(episodes_per_start):
-            # start at this (A,B) with random ball each episode
-            Ay, Ax = Apos;
+    rng = np.random.default_rng(0)
+
+    for (Apos, Bpos, ball) in starts_with_ball:
+        for _rep in range(EPISODES_PER_TRIPLE):
+            Ay, Ax = Apos
             By, Bx = Bpos
-            ball = 0 if rng.random() < 0.5 else 1
             s = State(Ay=Ay, Ax=Ax, By=By, Bx=Bx, ball=ball)
 
             learner.start(s)
+            # log the ε used at the episode start (for visualization)
+            eps_sched.append(learner._epsilon_for_state(s))
+
             G = 0.0
             t = 0
             while True:
@@ -742,11 +773,10 @@ def main():
                 learner.observe(ns, r, done)
                 s = ns
                 t += 1
-                if done or t > 200:
+                if done or t > 100:
                     learner.end_episode()
                     episode_lengths.append(t)
                     disc_returns.append(G)
-                    eps_sched.append(learner.epsA.eps)
                     break
 
             # --- policy drift (L1 / TV) between episodes ---
@@ -762,11 +792,10 @@ def main():
             })
 
             ep += 1
-
             if (ep % 5000) == 0:
                 last = disc_returns[-5000:] if len(disc_returns) >= 5000 else disc_returns
                 print(f"Episode {ep}: avg discounted return (last block) = {np.mean(last):.4f}, "
-                      f"ΔQ_max_last={learner.episode_deltas[-1]:.3e}, eps≈{learner.epsA.eps:.3f}")
+                      f"ΔQ_max_last={learner.episode_deltas[-1]:.3e}, eps0≈{eps_sched[-1]:.3f}")
 
     qpath = os.path.join(outdir, "nash_q_tables.pkl")
     save_q_tables_pickle(learner, qpath)
@@ -977,7 +1006,7 @@ def main():
     except Exception as e:
         print(f"[final eval plotting skipped] {e}")
 
-    env.close()
+    # env.close()
 
     with open(os.path.join(outdir, "training_summary.txt"), "w") as f:
         f.write(f"Episodes: {episodes}\n")
