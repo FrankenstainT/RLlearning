@@ -72,12 +72,13 @@ class MarkovSoccer:
     Reward +1 for A scoring, -1 for B scoring; discount gamma.
     """
 
-    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0,phi_coeff: float = 0.05):
+    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0,phi_coeff: float = 0.05, step_penalty_tau: float = 0.01):
         self.H, self.W = H, W
         self.gamma = float(gamma)
         self.rng = random.Random(seed)
         # canonical start positions; ball random each episode
         self.phi_coeff = float(phi_coeff)
+        self.tau = float(step_penalty_tau)
         #self._start_no_ball = State(Ay=2, Ax=1, By=1, Bx=3, ball=0)
 
         # enumerate all non-terminal distinct-cell states
@@ -136,8 +137,6 @@ class MarkovSoccer:
         if done:
             return s, r, True
 
-        A_new_y, A_new_x = Ay, Ax
-        B_new_y, B_new_x = By, Bx
         new_ball = ball
 
         if order == "AB":
@@ -174,6 +173,11 @@ class MarkovSoccer:
         ns = State(A_new_y, A_new_x, B_new_y, B_new_x, new_ball)
         # sanity: never same cell
         assert (ns.Ay, ns.Ax) != (ns.By, ns.Bx), "Invariant violated: same-cell created"
+        # ---- per-step penalty from A's perspective ----
+        if s.ball == 0:  # A owns ball -> penalize A's dithering
+            r -= self.tau
+        else:  # B owns ball -> this step is "bad for A" => add (i.e., less negative for A)
+            r += self.tau
         # potential-based shaping (preserves optimal policies)
         r += self.gamma * self.potential(ns) - self.potential(s)
         return ns, r, False
@@ -371,7 +375,9 @@ class NashQLearner:
 
         self.epsA = EpsGreedy(self.eps_init)
         self.epsB = EpsGreedy(self.eps_init)
-
+        self.ep_alpha_sum = 0.0  # <--- NEW
+        self.ep_alpha_count = 0  # <--- NEW
+        self.alpha_per_episode = []
         self.Q: Dict[State, Dict[Tuple[int, int], float]] = {}
         self.V: Dict[State, float] = {}
         self.PiA: Dict[State, np.ndarray] = {}
@@ -456,6 +462,9 @@ class NashQLearner:
         target = reward + (0.0 if done else self.gamma * self.V[s_next])
         old_q = self.Q[s][(aA, aB)]
         alpha = self._alpha(s, aA, aB)
+        # log alpha used on this update
+        self.ep_alpha_sum += alpha  # <--- NEW
+        self.ep_alpha_count += 1
         new_q = old_q + alpha * (target - old_q)
 
         bound = self.q_clip
@@ -472,6 +481,12 @@ class NashQLearner:
 
     def end_episode(self):
         self.episode_deltas.append(self._ep_max_delta)
+        # push mean alpha for this episode; guard div-by-zero
+        mean_alpha = (self.ep_alpha_sum / self.ep_alpha_count) if self.ep_alpha_count else 0.0
+        self.alpha_per_episode.append(mean_alpha)  # <--- NEW
+        # reset episode accumulators
+        self.ep_alpha_sum = 0.0  # <--- NEW
+        self.ep_alpha_count = 0
         self._ep_max_delta = 0.0
 
     def snapshot_policies(self):
@@ -762,11 +777,29 @@ def main():
     # --- policy drift trackers ---
     policy_drift_rows = []
     prev_snapshot = learner.snapshot_policies()
+    def is_corner(pos, H, W):
+        y, x = pos
+        return (y in (0, H - 1)) and (x in (0, W - 1))
 
+    def on_top_or_bottom_border(pos, H):
+        y, _ = pos
+        return y in (0, H - 1)
+
+    def start_weight(Apos, Bpos, H, W):
+        # If any is corner -> strongest weighting
+        if is_corner(Apos, H, W) or is_corner(Bpos, H, W):
+            return 100
+        # Else if any is on top/bottom border -> medium weighting
+        if on_top_or_bottom_border(Apos, H) or on_top_or_bottom_border(Bpos, H):
+            return 50
+        # Otherwise -> base
+        return 1
     ep = 0
 
     for (Apos, Bpos, ball) in starts_with_ball:
-        for _rep in range(EPISODES_PER_TRIPLE):
+        mult = start_weight(Apos, Bpos, env.H, env.W)
+        repeats = EPISODES_PER_TRIPLE * mult
+        for _rep in range(repeats):
             Ay, Ax = Apos
             By, Bx = Bpos
             s = State(Ay=Ay, Ax=Ax, By=By, Bx=Bx, ball=ball)
@@ -836,6 +869,10 @@ def main():
     plot_and_save(range(1, len(eps_sched) + 1), eps_sched,
                   "Epsilon Schedule (A)", "Episode", "ε",
                   os.path.join(outdir, "epsilon.png"))
+    plot_and_save(range(1, len(learner.alpha_per_episode) + 1), learner.alpha_per_episode,
+                  "Learning Rate (alpha) per Episode", "Episode", "alpha",
+                  os.path.join(outdir, "alpha_per_episode.png"))
+
     # -------- Policy drift outputs --------
     import csv
     drift_csv = os.path.join(outdir, "policy_drift.csv")
