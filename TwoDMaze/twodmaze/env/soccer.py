@@ -742,7 +742,7 @@ def main():
     starts_with_ball.sort(key=lambda t: owner_goal_distance(env, t[0], t[1], t[2]))
 
     # how many episodes for EACH (A,B,ball) triple
-    EPISODES_PER_TRIPLE = 1#000  #  (even across balls)
+    EPISODES_PER_TRIPLE = 1000  #  (even across balls)
     episodes = EPISODES_PER_TRIPLE * len(starts_with_ball)
 
     learner = NashQLearner(
