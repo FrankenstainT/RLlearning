@@ -156,25 +156,30 @@ def solve_both_policies(M):
 
     return x, y, v
 
+
 # ------------------ TEST HARNESS FOR solve_both_policies ------------------
 
 from math import isclose
 
 EPS = 1e-7
 
+
 def almost_equal(a, b, tol=1e-6):
     return abs(a - b) <= tol
+
 
 def vec_close(v1, v2, tol=1e-6):
     if len(v1) != len(v2):
         return False
     return all(abs(a - b) <= tol for a, b in zip(v1, v2))
 
+
 def normalize_or_uniform(v):
     s = sum(max(0.0, x) for x in v)
     if s <= 1e-12:
-        return [1.0/len(v)] * len(v)
-    return [max(0.0, x)/s for x in v]
+        return [1.0 / len(v)] * len(v)
+    return [max(0.0, x) / s for x in v]
+
 
 def saddle_checks(M, x, y, v, tol=1e-5, verbose=False):
     """Verify saddle conditions:
@@ -217,6 +222,7 @@ def saddle_checks(M, x, y, v, tol=1e-5, verbose=False):
         assert val - 1e-7 <= v + tol, f"row {i} vs y violates E_y[M[i,:]]≤v"
     return True
 
+
 def run_case(name, M, expect_x=None, expect_y=None, expect_v=None,
              check_exact=False, verbose=False):
     print(f"\n=== Case: {name} ===")
@@ -252,32 +258,35 @@ def run_case(name, M, expect_x=None, expect_y=None, expect_v=None,
 
     print("✓ Passed.")
 
+
 def add_constant(M, c):
     return [[M[i][j] + c for j in range(len(M[0]))] for i in range(len(M))]
+
 
 def scale_matrix(M, k):
     return [[k * M[i][j] for j in range(len(M[0]))] for i in range(len(M))]
 
+
 def test_all():
     # 1) Zero matrix (degenerate: any strategies ok; expect v=0; we accept uniform)
-    M0 = [[0,0],
-          [0,0]]
+    M0 = [[0, 0],
+          [0, 0]]
     run_case("Zero 2x2", M0, expect_v=0.0, verbose=True)
 
     # 2) Matching Pennies (value 0, uniform strategies)
     #    Row payoff: +1 on match for row? Classic form: [[1,-1],[-1,1]]
-    MP = [[ 1, -1],
-          [-1,  1]]
+    MP = [[1, -1],
+          [-1, 1]]
     run_case("Matching Pennies", MP,
-             expect_x=[0.5, 0.5], expect_y=[0.5,0.5], expect_v=0.0, check_exact=True)
+             expect_x=[0.5, 0.5], expect_y=[0.5, 0.5], expect_v=0.0, check_exact=True)
 
     # 3) Rock–Paper–Scissors (value 0, uniform strategies)
     #    R beats S, S beats P, P beats R; tie=0, win=+1, loss=-1
-    RPS = [[ 0, -1,  1],   # R vs (R,P,S)
-           [ 1,  0, -1],   # P vs (R,P,S)
-           [-1,  1,  0]]   # S vs (R,P,S)
+    RPS = [[0, -1, 1],  # R vs (R,P,S)
+           [1, 0, -1],  # P vs (R,P,S)
+           [-1, 1, 0]]  # S vs (R,P,S)
     run_case("RPS", RPS,
-             expect_x=[1/3,1/3,1/3], expect_y=[1/3,1/3,1/3], expect_v=0.0, check_exact=True)
+             expect_x=[1 / 3, 1 / 3, 1 / 3], expect_y=[1 / 3, 1 / 3, 1 / 3], expect_v=0.0, check_exact=True)
 
     # 4) Row domination: row 0 strictly dominates row 1
     M_dom_row = [[2, 2],
@@ -310,8 +319,10 @@ def test_all():
     c = 5.0
     x1, y1, v1 = solve_both_policies(MP)
     x2, y2, v2 = solve_both_policies(add_constant(MP, c))
-    x1 = normalize_or_uniform(x1); y1 = normalize_or_uniform(y1)
-    x2 = normalize_or_uniform(x2); y2 = normalize_or_uniform(y2)
+    x1 = normalize_or_uniform(x1);
+    y1 = normalize_or_uniform(y1)
+    x2 = normalize_or_uniform(x2);
+    y2 = normalize_or_uniform(y2)
     assert vec_close(x1, x2, tol=1e-6), "Shift invariance failed for x"
     assert vec_close(y1, y2, tol=1e-6), "Shift invariance failed for y"
     assert almost_equal(v2, v1 + c, tol=1e-6), "Shift invariance failed for v"
@@ -321,22 +332,23 @@ def test_all():
     k = 3.5
     x1, y1, v1 = solve_both_policies(RPS)
     x2, y2, v2 = solve_both_policies(scale_matrix(RPS, k))
-    x1 = normalize_or_uniform(x1); y1 = normalize_or_uniform(y1)
-    x2 = normalize_or_uniform(x2); y2 = normalize_or_uniform(y2)
+    x1 = normalize_or_uniform(x1);
+    y1 = normalize_or_uniform(y1)
+    x2 = normalize_or_uniform(x2);
+    y2 = normalize_or_uniform(y2)
     assert vec_close(x1, x2, tol=1e-6), "Scale invariance failed for x"
     assert vec_close(y1, y2, tol=1e-6), "Scale invariance failed for y"
-    assert almost_equal(v2, k*v1, tol=1e-6), "Scale invariance failed for v"
+    assert almost_equal(v2, k * v1, tol=1e-6), "Scale invariance failed for v"
     print("✓ Positive scaling invariance (policies same, value *k) passed.")
 
     print("\nAll tests completed.\n")
-
 
 
 if __name__ == "__main__":
     random.seed(7)
     m = n = 4
     M = [[round(random.uniform(-5, 10), 2) for _ in range(n)] for __ in range(m)]
-    #M = [[0 for _ in range(n)] for __ in range(m)]
+    # M = [[0 for _ in range(n)] for __ in range(m)]
     # Solve both policies at once
     x, y, v = solve_both_policies(M)
 

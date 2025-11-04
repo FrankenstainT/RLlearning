@@ -72,7 +72,8 @@ class MarkovSoccer:
     Reward +1 for A scoring, -1 for B scoring; discount gamma.
     """
 
-    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0,phi_coeff: float = 0.05, step_penalty_tau: float = 0.01):
+    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0,phi_coeff: float = 0.05, step_penalty_tau: float = 0.01,possession_reward: float = 0.2,
+        ball_seek_coeff: float = 0.03,):
         self.H, self.W = H, W
         self.gamma = float(gamma)
         self.rng = random.Random(seed)
@@ -80,7 +81,8 @@ class MarkovSoccer:
         self.phi_coeff = float(phi_coeff)
         self.tau = float(step_penalty_tau)
         #self._start_no_ball = State(Ay=2, Ax=1, By=1, Bx=3, ball=0)
-
+        self.possession_reward = float(possession_reward)
+        self.ball_seek_coeff = float(ball_seek_coeff)
         # enumerate all non-terminal distinct-cell states
         self.states: List[State] = []
         for Ay in range(H):
@@ -136,7 +138,9 @@ class MarkovSoccer:
         r, done = self._score_check(s, aA, aB, ball)
         if done:
             return s, r, True
-
+        # ----- distances *before* move (for shaping deltas) -----
+        # distance between A and B before transition
+        prev_dist_AB = abs(Ay - By) + abs(Ax - Bx)
         new_ball = ball
 
         if order == "AB":
@@ -178,6 +182,30 @@ class MarkovSoccer:
             r -= self.tau
         else:  # B owns ball -> this step is "bad for A" => add (i.e., less negative for A)
             r += self.tau
+        swing = False
+        # ---- possession swing shaping ----
+        if ball == 1 and new_ball == 0:
+            r += self.possession_reward  # A stole from B
+            swing = True
+        elif ball == 0 and new_ball == 1:
+            r -= self.possession_reward  # A lost to B
+            swing = True
+
+        # ----- chase shaping *by delta* -----
+        # distance after transition
+        new_dist_AB = abs(ns.Ay - ns.By) + abs(ns.Ax - ns.Bx)
+        if not swing:
+            if ns.ball == 1:
+                # B has ball -> A is the chaser
+                # reward A when A gets closer: old - new
+                dist_improvement = prev_dist_AB - new_dist_AB
+                r += self.ball_seek_coeff * float(dist_improvement)
+                # if they stay, dist_improvement = 0 -> no shaping
+            else:
+                # A has ball -> B is the chaser -> A prefers B to be farther
+                # reward A when distance increases: new - old
+                dist_separation = new_dist_AB - prev_dist_AB
+                r += self.ball_seek_coeff * float(dist_separation)
         # potential-based shaping (preserves optimal policies)
         r += self.gamma * self.potential(ns) - self.potential(s)
         return ns, r, False
@@ -719,6 +747,8 @@ def frames_to_gif_mp4(frames_dir: str, out_gif: str, out_mp4: str, fps: int = 3)
 def main():
     outdir = "soccer_mild_stat"
     ensure_dir(outdir)
+    WATCH_EPISODE = 2_685_000
+    big_drift_records = []
 
     np.random.seed(0)
     random.seed(0)
@@ -830,6 +860,34 @@ def main():
 
             # --- policy drift (L1 / TV) between episodes ---
             drift = learner.policy_drift(prev_snapshot)
+
+            if ep >= WATCH_EPISODE:
+                cur_snap = drift["current_snapshot"]  # {"A": {state: np.array}, "B": {...}}
+                prev_snap = prev_snapshot  # snapshot from previous episode
+
+                for s, stats in drift["per_state"].items():
+                    la = stats["l1_A"]
+                    lb = stats["l1_B"]
+                    if la > 1.0 or lb > 1.0:
+                        # get policies now (after update)
+                        cur_piA = cur_snap["A"].get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
+                        cur_piB = cur_snap["B"].get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
+
+                        # get policies before update
+                        prev_piA = prev_snap["A"].get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
+                        prev_piB = prev_snap["B"].get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
+
+                        big_drift_records.append({
+                            "episode": ep,
+                            "state": (s.Ay, s.Ax, s.By, s.Bx, s.ball),
+                            "l1_A": float(la),
+                            "l1_B": float(lb),
+                            "prev_piA": prev_piA.tolist(),
+                            "prev_piB": prev_piB.tolist(),
+                            "cur_piA": cur_piA.tolist(),
+                            "cur_piB": cur_piB.tolist(),
+                        })
+
             prev_snapshot = drift["current_snapshot"]
             policy_drift_rows.append({
                 "episode": ep,
@@ -885,6 +943,11 @@ def main():
         w.writeheader()
         w.writerows(policy_drift_rows)
     print(f"[saved] {drift_csv}")
+    import json
+    big_drift_path = os.path.join(outdir, "big_policy_drifts.json")
+    with open(big_drift_path, "w") as f:
+        json.dump(big_drift_records, f, indent=2)
+    print(f"[saved] big per-state drifts -> {big_drift_path}")
 
     xs = [r["episode"] for r in policy_drift_rows]
 
