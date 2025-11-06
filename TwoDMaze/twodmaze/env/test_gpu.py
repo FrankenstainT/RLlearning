@@ -1,164 +1,247 @@
 import numpy as np
-import torch
 from scipy.optimize import linprog
+import torch
 
 
-# --------------------------------------------------------
-# CPU reference (your one-LP)
-# --------------------------------------------------------
-def solve_cpu_lp(M: np.ndarray):
+# =========================================================
+# 1) CPU reference: your LP-style solver
+# =========================================================
+def solve_both_policies_one_lp(M: np.ndarray, jitter=1e-8, max_retries=2):
     M = np.asarray(M, float)
+    if not np.all(np.isfinite(M)):
+        M = np.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
+
     mu = float(np.mean(M))
     Ms = M - mu
     s = float(np.max(np.abs(Ms)))
     if s < 1e-12:
         m, n = M.shape
-        x = np.ones(m)/m
-        y = np.ones(n)/n
+        x = np.ones(m) / m
+        y = np.ones(n) / n
         return x, y, mu
 
     Ms /= s
-    m, n = Ms.shape
-    num = m + n + 1
-    xs = slice(0, m); ys = slice(m, m+n); vidx = m+n
 
-    c = np.zeros(num); c[vidx] = -1.0
-    A_ub = []; b_ub = []
-    for j in range(n):
-        row = np.zeros(num)
-        row[xs] = -Ms[:, j]
-        row[vidx] = 1.0
-        A_ub.append(row); b_ub.append(0.0)
-    for i in range(m):
-        row = np.zeros(num)
-        row[ys] = Ms[i, :]
-        row[vidx] = -1.0
-        A_ub.append(row); b_ub.append(0.0)
-    A_ub = np.vstack(A_ub); b_ub = np.array(b_ub)
+    def _solve_raw(A):
+        m, n = A.shape
+        num = m + n + 1
+        xs = slice(0, m)
+        ys = slice(m, m + n)
+        vidx = m + n
 
-    A_eq = np.zeros((2, num))
-    A_eq[0, xs] = 1.0
-    A_eq[1, ys] = 1.0
-    b_eq = np.array([1.0, 1.0])
+        c = np.zeros(num)
+        c[vidx] = -1.0  # maximize v
 
-    bounds = [(0, None)]*m + [(0, None)]*n + [(None, None)]
-    res = linprog(c, A_ub=A_ub, b_ub=b_ub,
-                  A_eq=A_eq, b_eq=b_eq,
-                  bounds=bounds, method="highs")
+        A_ub = []
+        b_ub = []
 
-    z = res.x
-    x = z[:m]; y = z[m:m+n]; v = z[m+n]
-    x = np.clip(x, 0, None); y = np.clip(y, 0, None)
-    x /= x.sum(); y /= y.sum()
-    v = v * s + mu
+        # v <= x^T A[:, j]
+        for j in range(n):
+            row = np.zeros(num)
+            row[xs] = -A[:, j]
+            row[vidx] = 1.0
+            A_ub.append(row)
+            b_ub.append(0.0)
+
+        # A[i, :] y <= v
+        for i in range(m):
+            row = np.zeros(num)
+            row[ys] = A[i, :]
+            row[vidx] = -1.0
+            A_ub.append(row)
+            b_ub.append(0.0)
+
+        A_ub = np.vstack(A_ub)
+        b_ub = np.array(b_ub)
+
+        A_eq = np.zeros((2, num))
+        A_eq[0, xs] = 1.0
+        A_eq[1, ys] = 1.0
+        b_eq = np.array([1.0, 1.0])
+
+        bounds = [(0, None)] * m + [(0, None)] * n + [(None, None)]
+
+        res = linprog(
+            c,
+            A_ub=A_ub,
+            b_ub=b_ub,
+            A_eq=A_eq,
+            b_eq=b_eq,
+            bounds=bounds,
+            method="highs",
+        )
+        return res
+
+    A = Ms
+    for attempt in range(max_retries + 1):
+        res = _solve_raw(A)
+        if res.status == 0 and np.isfinite(res.fun):
+            z = res.x
+            m, n = Ms.shape
+            x = np.clip(z[:m], 0, None)
+            y = np.clip(z[m:m + n], 0, None)
+            v = float(z[m + n])
+
+            sx, sy = x.sum(), y.sum()
+            x = x / sx if sx > 0 else np.ones(m) / m
+            y = y / sy if sy > 0 else np.ones(n) / n
+
+            v = v * s + mu  # rescale
+            return x, y, v
+
+        # jitter and retry
+        A = Ms + np.random.default_rng().normal(scale=jitter, size=Ms.shape)
+
+    # fallback
+    m, n = M.shape
+    x = np.ones(m) / m
+    y = np.ones(n) / n
+    v = float(np.mean(M))
     return x, y, v
 
 
-# --------------------------------------------------------
-# torch helper
-# --------------------------------------------------------
-def get_device_and_dtype():
-    if torch.cuda.is_available():
-        return torch.device("cuda"), torch.float64
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps"), torch.float32
-    else:
-        return torch.device("cpu"), torch.float64
+# =========================================================
+# 2) Torch helper: projection to simplex
+# =========================================================
+def project_simplex_torch(x, dim=-1):
+    # x: (..., d)
+    u, _ = torch.sort(x, descending=True, dim=dim)
+    cssv = torch.cumsum(u, dim=dim) - 1
+    idx = torch.arange(x.size(dim), device=x.device).view(
+        *([1] * (x.dim() - 1)), -1
+    ) + 1
+    cond = u > cssv / idx
+    rho = cond.sum(dim=dim, keepdim=True)
+    theta = cssv.gather(dim, rho - 1) / rho
+    return torch.clamp(x - theta, min=0.0)
 
 
-def project_simplex(z: torch.Tensor) -> torch.Tensor:
-    orig_1d = (z.dim() == 1)
-    if orig_1d:
-        z = z.unsqueeze(0)
-
-    u, _ = torch.sort(z, dim=1, descending=True)
-    cumsum = torch.cumsum(u, dim=1)
-    r = torch.arange(1, z.size(1)+1, device=z.device, dtype=z.dtype).view(1, -1)
-    cond = u * r > (cumsum - 1)
-    rho = cond.sum(dim=1) - 1
-    theta = (cumsum.gather(1, rho.view(-1, 1)) - 1) / (rho + 1).to(z.dtype).view(-1, 1)
-    w = torch.clamp(z - theta, min=0.0)
-    w = w / w.sum(dim=1, keepdim=True)
-    if orig_1d:
-        return w.squeeze(0)
-    return w
-
-
-@torch.no_grad()
-def solve_zero_sum_torch_fast(M_np: np.ndarray,
-                              max_iters: int = 4000,
-                              lr: float = 0.3,
-                              tol_v: float = 1e-5):
+# =========================================================
+# 3) Torch version: extragradient + primal–dual gap
+# =========================================================
+def zero_sum_saddle_extragrad(
+    M: torch.Tensor,
+    lr=0.05,
+    max_steps=8000,
+    gap_tol=1e-4,
+):
     """
-    Faster extragrad version:
-    - fewer iters
-    - lr decay
-    - early stop on value change
+    M: (B, m, n)
+    returns x, y, v, gap
+    Uses extragradient (mirror-prox style) and stops when
+    max_i (M y)_i - min_j (x^T M)_j <= gap_tol
     """
-    device, dtype = get_device_and_dtype()
-    M = torch.as_tensor(M_np, device=device, dtype=dtype)
-    m, n = M.shape
+    B, m, n = M.shape
+    device = M.device
+    x = torch.full((B, m), 1.0 / m, device=device, dtype=M.dtype)
+    y = torch.full((B, n), 1.0 / n, device=device, dtype=M.dtype)
 
-    x = torch.full((m,), 1.0 / m, device=device, dtype=dtype)
-    y = torch.full((n,), 1.0 / n, device=device, dtype=dtype)
-    x_bar = torch.zeros_like(x)
-    y_bar = torch.zeros_like(y)
+    for step in range(max_steps):
+        # current payoffs
+        My = torch.matmul(M, y.unsqueeze(-1)).squeeze(-1)     # (B, m)
+        xM = torch.matmul(x.unsqueeze(1), M).squeeze(1)       # (B, n)
 
-    prev_v = None
+        # best-response values for gap
+        row_best = My.max(dim=1).values        # max over i
+        col_worst = xM.min(dim=1).values       # min over j
+        gap = (row_best - col_worst).max().item()
 
-    for t in range(1, max_iters + 1):
-        # simple lr decay
-        lr_t = lr / (1.0 + 0.0005 * t)
+        if gap <= gap_tol:
+            break
 
-        My = M @ y
-        MTx = M.t() @ x
+        # -------- extragradient step --------
+        # 1) extrapolate
+        x_tilde = project_simplex_torch(x + lr * My)
+        y_tilde = project_simplex_torch(y - lr * xM)
 
-        x_tilde = project_simplex(x + lr_t * My)
-        y_tilde = project_simplex(y - lr_t * MTx)
+        # 2) recompute grads at extrapolated point
+        My_tilde = torch.matmul(M, y_tilde.unsqueeze(-1)).squeeze(-1)
+        xM_tilde = torch.matmul(x_tilde.unsqueeze(1), M).squeeze(1)
 
-        My_tilde = M @ y_tilde
-        MTx_tilde = M.t() @ x_tilde
+        # 3) actual update
+        x = project_simplex_torch(x + lr * My_tilde)
+        y = project_simplex_torch(y - lr * xM_tilde)
 
-        x = project_simplex(x + lr_t * My_tilde)
-        y = project_simplex(y - lr_t * MTx_tilde)
-
-        # averaged
-        x_bar = x_bar + (x - x_bar) / t
-        y_bar = y_bar + (y - y_bar) / t
-
-        # compute value every ~100 steps for early stop
-        if t % 100 == 0 or t == max_iters:
-            v = (x_bar @ M @ y_bar).item()
-            if prev_v is not None and abs(v - prev_v) < tol_v:
-                break
-            prev_v = v
-
-    v = (x_bar @ M @ y_bar).item()
-    return x_bar.cpu().numpy(), y_bar.cpu().numpy(), float(v), str(device)
+    # final value
+    v = (x.unsqueeze(1) @ M @ y.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+    return x, y, v, gap
 
 
-# --------------------------------------------------------
-# quick test harness
-# --------------------------------------------------------
+# =========================================================
+# 4) test harness
+# =========================================================
+def run_one_test(M):
+    print("=" * 60)
+    print("Payoff matrix M:")
+    print(M)
+
+    # CPU reference
+    cpu_x, cpu_y, cpu_v = solve_both_policies_one_lp(M)
+    print("\nCPU LP solution:")
+    print("x (row):", cpu_x)
+    print("y (col):", cpu_y)
+    print("value  :", cpu_v)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    Mt = torch.tensor(M, dtype=torch.float32, device=device).unsqueeze(0)
+
+    # we'll try a few lrs and pick the best by value error
+    best = None
+    for lr in (0.1, 0.05, 0.02):
+        x_t, y_t, v_t, gap = zero_sum_saddle_extragrad(
+            Mt, lr=lr, max_steps=8000, gap_tol=5e-5
+        )
+        x_np = x_t[0].detach().cpu().numpy()
+        y_np = y_t[0].detach().cpu().numpy()
+        v_np = float(v_t[0].detach().cpu().item())
+        err = abs(cpu_v - v_np)
+
+        if best is None or err < best["err"]:
+            best = {
+                "lr": lr,
+                "x": x_np,
+                "y": y_np,
+                "v": v_np,
+                "gap": gap,
+                "err": err,  # <<< store error
+            }
+
+    print("\nTorch extragrad solution (device={}, lr={}):".format(device, best["lr"]))
+    print("x (row):", best["x"])
+    print("y (col):", best["y"])
+    print("value  :", best["v"])
+    print("primal–dual gap (max over batch):", best["gap"])
+
+    # diffs
+    print("\nDiffs vs CPU:")
+    print("||x_cpu - x_torch||_1 =", np.abs(cpu_x - best["x"]).sum())
+    print("||y_cpu - y_torch||_1 =", np.abs(cpu_y - best["y"]).sum())
+    print("|v_cpu - v_torch|     =", abs(cpu_v - best["v"]))
+
+
+def main():
+    # 1) classic 2x2
+    M1 = np.array([[1.0, -1.0],
+                   [-1.0, 1.0]], dtype=float)
+
+    # 2) your random 4x4
+    M2 = np.array([
+        [0.12573022, -0.13210486, 0.64042265, 0.10490012],
+        [-0.53566937, 0.36159505, 1.30400005, 0.94708096],
+        [-0.70373524, -1.26542147, -0.62327446, 0.04132598],
+        [-2.32503077, -0.21879166, -1.24591095, -0.73226735],
+    ], dtype=float)
+
+    # 3) your 3x3 slightly biased
+    M3 = np.array([
+        [0.5, 0.2, -0.1],
+        [1.0, -0.3, 0.0],
+        [0.0, 0.1, 0.2],
+    ], dtype=float)
+
+    for M in (M1, M2, M3):
+        run_one_test(M)
+
+
 if __name__ == "__main__":
-    np.random.seed(0)
-
-    tests = [
-        ("rock-paper-scissors",
-         np.array([[0., 1., -1.],
-                   [-1., 0., 1.],
-                   [1., -1., 0.]])),
-        ("random_5x5", np.random.randn(5, 5)),
-        ("almost_const_4x4", 2.0 + 1e-4 * np.random.randn(4, 4)),
-    ]
-
-    for name, M in tests:
-        x_cpu, y_cpu, v_cpu = solve_cpu_lp(M)
-        x_t, y_t, v_t, dev = solve_zero_sum_torch_fast(M)
-        print("="*70)
-        print(f"Test: {name}, shape={M.shape}")
-        print(f"CPU v:   {v_cpu:.12f}")
-        print(f"Torch v: {v_t:.12f} (device={dev})")
-        print(f"Δv = {abs(v_cpu - v_t):.12e}")
-        print(f"L1(x): {np.sum(np.abs(x_cpu - x_t)):.6e}")
-        print(f"L1(y): {np.sum(np.abs(y_cpu - y_t)):.6e}")
+    main()

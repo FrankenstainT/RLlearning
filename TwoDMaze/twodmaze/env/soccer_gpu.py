@@ -324,116 +324,133 @@ def solve_both_policies_one_lp(M: np.ndarray, jitter=1e-8, max_retries=2):
     v = float(np.mean(M))  # harmless placeholder
     return x, y, v
 
+
 # ============================================================
-#     TORCH / GPU GAME SOLVER (approx, fast)
+#     TORCH / GPU GAME SOLVER (extragrad)
 # ============================================================
 def _torch_device_and_dtype():
     if torch.cuda.is_available():
-        return torch.device("cuda"), torch.float64
-    # you already defined DEVICE above, but let's keep this local:
+        return torch.device("cuda"), torch.float32
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps"), torch.float32
-    return torch.device("cpu"), torch.float64
+    return torch.device("cpu"), torch.float32
 
 
-def project_simplex_torch(z: torch.Tensor) -> torch.Tensor:
-    orig_1d = (z.dim() == 1)
-    if orig_1d:
-        z = z.unsqueeze(0)
-
-    # sort
-    u, _ = torch.sort(z, dim=1, descending=True)
-    cumsum = torch.cumsum(u, dim=1)
-    r = torch.arange(1, z.size(1) + 1, device=z.device, dtype=z.dtype).view(1, -1)
-    cond = u * r > (cumsum - 1)
-    rho = cond.sum(dim=1) - 1
-    theta = (cumsum.gather(1, rho.view(-1, 1)) - 1) / (rho + 1).to(z.dtype).view(-1, 1)
-    w = torch.clamp(z - theta, min=0.0)
-    w = w / w.sum(dim=1, keepdim=True)
-    if orig_1d:
-        return w.squeeze(0)
-    return w
+def project_simplex_torch(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Euclidean projection onto the probability simplex.
+    Works on (..., d). Returns tensor of same shape.
+    """
+    # make last dim the simplex dim
+    u, _ = torch.sort(x, descending=True, dim=dim)
+    cssv = torch.cumsum(u, dim=dim) - 1
+    r = torch.arange(1, x.size(dim) + 1, device=x.device, dtype=x.dtype)
+    # shape r to broadcast
+    shape = [1] * x.dim()
+    shape[dim] = -1
+    r = r.view(*shape)
+    cond = u * r > cssv
+    # rho: index of last True
+    rho = cond.sum(dim=dim, keepdim=True) - 1
+    theta = cssv.gather(dim, rho) / (rho.to(x.dtype) + 1)
+    w = torch.clamp(x - theta, min=0.0)
+    # renormalize just in case of tiny numerical drift
+    return w / w.sum(dim=dim, keepdim=True)
 
 
 @torch.no_grad()
-def solve_zero_sum_torch_fast(M_np: np.ndarray,
-                              max_iters: int = 800,
-                              lr: float = 0.35,
-                              tol_v: float = 1e-5):
+def zero_sum_saddle_extragrad_single(
+    M_np: np.ndarray,
+    lr_list=(0.1, 0.05, 0.02),
+    max_steps=8000,
+    gap_tol=5e-5,
+):
     """
-    Approximate zero-sum solver on GPU/torch.
-    Good enough to match value to ~1e-5 vs CPU LP.
+    Solve a single zero-sum matrix game using mirror-prox/extragrad
+    on GPU/torch. We try several learning rates and keep the one whose
+    value is closest to the true saddle (estimated by the same method).
+    Returns (x, y, v).
     """
     device, dtype = _torch_device_and_dtype()
     M = torch.as_tensor(M_np, device=device, dtype=dtype)
     m, n = M.shape
 
-    x = torch.full((m,), 1.0 / m, device=device, dtype=dtype)
-    y = torch.full((n,), 1.0 / n, device=device, dtype=dtype)
-    x_bar = torch.zeros_like(x)
-    y_bar = torch.zeros_like(y)
+    best = None
 
-    prev_v = None
-    for t in range(1, max_iters + 1):
-        lr_t = lr / (1.0 + 0.0005 * t)
+    for lr in lr_list:
+        # init
+        x = torch.full((m,), 1.0 / m, device=device, dtype=dtype)
+        y = torch.full((n,), 1.0 / n, device=device, dtype=dtype)
 
-        # extragrad step
-        My = M @ y
-        MTx = M.t() @ x
+        for step in range(max_steps):
+            # current payoffs
+            My = M @ y              # (m,)
+            xM = (x @ M).view(-1)    # (n,)
 
-        x_tilde = project_simplex_torch(x + lr_t * My)
-        y_tilde = project_simplex_torch(y - lr_t * MTx)
+            # primal–dual gap
+            row_best = My.max()
+            col_worst = xM.min()
+            gap = (row_best - col_worst).item()
 
-        My_tilde = M @ y_tilde
-        MTx_tilde = M.t() @ x_tilde
-
-        x = project_simplex_torch(x + lr_t * My_tilde)
-        y = project_simplex_torch(y - lr_t * MTx_tilde)
-
-        # running averages
-        x_bar = x_bar + (x - x_bar) / t
-        y_bar = y_bar + (y - y_bar) / t
-
-        if t % 100 == 0 or t == max_iters:
-            v = (x_bar @ M @ y_bar).item()
-            if prev_v is not None and abs(v - prev_v) < tol_v:
+            if gap <= gap_tol:
                 break
-            prev_v = v
 
-    v = (x_bar @ M @ y_bar).item()
-    return x_bar.cpu().numpy(), y_bar.cpu().numpy(), float(v)
+            # extragrad:
+            # 1) extrapolate
+            x_tilde = project_simplex_torch(x + lr * My, dim=0)
+            y_tilde = project_simplex_torch(y - lr * xM, dim=0)
+
+            # 2) recompute grads at extrapolated point
+            My_tilde = M @ y_tilde
+            xM_tilde = (x_tilde @ M).view(-1)
+
+            # 3) actual update
+            x = project_simplex_torch(x + lr * My_tilde, dim=0)
+            y = project_simplex_torch(y - lr * xM_tilde, dim=0)
+
+        v = (x @ M @ y).item()
+        err = gap  # we can use the final gap as “quality”
+
+        if (best is None) or (err < best["err"]):
+            best = {
+                "x": x.detach().cpu().numpy(),
+                "y": y.detach().cpu().numpy(),
+                "v": float(v),
+                "err": err,
+            }
+
+    return best["x"], best["y"], best["v"]
+
+
 # ============================================================
 #     UNIFIED GAME SOLVER
 # ============================================================
-# set to True after we announce that we're using torch to solve stage games
 _SOLVE_GAME_TORCH_ANNOUNCED = False
 
 def solve_game(M: np.ndarray):
     """
-    Try GPU/torch first (if CUDA/MPS present), else CPU LP.
-    Print once if we actually use torch.
+    Try GPU/torch extragrad first (if available), else fall back to CPU LP.
+    Returns (x, y, v).
     """
     global _SOLVE_GAME_TORCH_ANNOUNCED
 
-    # CUDA first
-    if torch.cuda.is_available():
-        if not _SOLVE_GAME_TORCH_ANNOUNCED:
-            print("[solve_game] using TORCH solver on CUDA")
-            _SOLVE_GAME_TORCH_ANNOUNCED = True
-        return solve_zero_sum_torch_fast(M)
+    has_torch_accel = (
+        torch.cuda.is_available()
+        or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+    )
 
-    # MPS fallback (Apple)
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    if has_torch_accel:
         if not _SOLVE_GAME_TORCH_ANNOUNCED:
-            print("[solve_game] using TORCH solver on MPS")
+            print("[solve_game] using TORCH extragrad solver")
             _SOLVE_GAME_TORCH_ANNOUNCED = True
-        return solve_zero_sum_torch_fast(M)
+        return zero_sum_saddle_extragrad_single(M)
 
-    # otherwise CPU LP
+    # fallback: exact CPU LP
     if not _SOLVE_GAME_TORCH_ANNOUNCED:
         print("[solve_game] using CPU LP solver (scipy.linprog)")
         _SOLVE_GAME_TORCH_ANNOUNCED = True
     return solve_both_policies_one_lp(M)
+
 
 
 # ============================================================
