@@ -750,6 +750,54 @@ def save_q_tables_pickle(learner: NashQLearner, outpath: str):
         mats[s] = M
     with open(outpath, "wb") as f:
         pickle.dump(mats, f)
+def save_state_visits_csv(learner: NashQLearner, outpath: str, top_k: int = 50):
+    """
+    Save per-state visit counts in a directly readable CSV.
+    Also compute basic stats and return top-K most and least visited states.
+    """
+    import csv
+
+    rows = []
+    for s, cnt in learner.state_visits.items():
+        rows.append({
+            "Ay": s.Ay,
+            "Ax": s.Ax,
+            "By": s.By,
+            "Bx": s.Bx,
+            "ball": s.ball,
+            "visits": int(cnt),
+        })
+
+    # sort descending by visits for the CSV
+    rows.sort(key=lambda r: r["visits"], reverse=True)
+
+    with open(outpath, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["Ay", "Ax", "By", "Bx", "ball", "visits"])
+        w.writeheader()
+        w.writerows(rows)
+
+    counts = [r["visits"] for r in rows]
+    total_states = len(counts)
+    max_vis = max(counts) if counts else 0
+    min_vis = min(counts) if counts else 0
+    mean_vis = (sum(counts) / total_states) if total_states else 0.0
+
+    # top-K most
+    top_most = rows[:top_k]
+
+    # top-K least: take from the end of the *descending* list
+    # but keep ascending order in the returned list to read nicer
+    bottom_part = rows[-top_k:] if total_states >= top_k else rows[:]
+    top_least = sorted(bottom_part, key=lambda r: r["visits"])
+
+    return {
+        "total_states": total_states,
+        "max_visits": max_vis,
+        "min_visits": min_vis,
+        "mean_visits": mean_vis,
+        "top_most": top_most,
+        "top_least": top_least,
+    }
 
 
 def nash_report_all_states(learner: NashQLearner, outdir: str, tol: float = 1e-4):
@@ -876,9 +924,9 @@ def frames_to_gif_mp4(frames_dir: str, out_gif: str, out_mp4: str, fps: int = 3)
 # ============================================================
 
 def main():
-    outdir = "soccer_mild_stat"
+    outdir = "soccer_contrast_stat"
     ensure_dir(outdir)
-    WATCH_EPISODE = 2_685_000
+
     big_drift_records = []
 
     np.random.seed(0)
@@ -918,8 +966,8 @@ def main():
     starts_with_ball.sort(key=lambda t: owner_goal_distance(env, t[0], t[1], t[2]))
 
     # how many episodes for EACH (A,B,ball) triple
-    EPISODES_PER_TRIPLE = 1000  #  (even across balls)
-
+    EPISODES_PER_TRIPLE = 100  #  (even across balls)
+    WATCH_EPISODE = 2_685*EPISODES_PER_TRIPLE
     learner = NashQLearner(
         gamma=env.gamma,
         alpha0=0.6,
@@ -947,14 +995,14 @@ def main():
     def start_weight(Apos, Bpos, H, W):
         # If any is corner -> strongest weighting
         if is_corner(Apos, H, W) and is_corner(Bpos, H, W):
-            return 16
+            return 320
         if is_corner(Apos, H, W) and on_top_or_bottom_border(Bpos, H) or on_top_or_bottom_border(Apos, H) and is_corner(Bpos, H, W):
-            return 8
+            return 160
         # Else if any is on top/bottom border -> medium weighting
         if on_top_or_bottom_border(Apos, H) and on_top_or_bottom_border(Bpos, H) or is_corner(Apos, H, W) or is_corner(Bpos, H, W):
-            return 4
+            return 160
         if on_top_or_bottom_border(Apos, H) or on_top_or_bottom_border(Bpos, H):
-            return 2
+            return 40
         # Otherwise -> base
         return 1
     ep = 0
@@ -1036,6 +1084,9 @@ def main():
     qpath = os.path.join(outdir, "nash_q_tables.pkl")
     save_q_tables_pickle(learner, qpath)
     print(f"Saved Nash-Q tables to {qpath}")
+    visits_csv = os.path.join(outdir, "state_visits.csv")
+    visit_stats = save_state_visits_csv(learner, visits_csv, top_k=50)
+    print(f"Saved state visit counts to {visits_csv}")
     # -------- Nash exploitability report (print + save) --------
     summary, report_path = nash_report_all_states(learner, outdir=outdir, tol=1e-4)
     print(f"[saved] exploitability report -> {report_path}")
@@ -1250,11 +1301,27 @@ def main():
     with open(os.path.join(outdir, "training_summary.txt"), "w") as f:
         f.write(f"Episodes: {ep}\n")
         f.write(f"Final epsilon ~ {eps_sched[-1] if eps_sched else 'NA'}\n")
-        # if eval_points:
-        #     f.write(f"Final periodic exploitability: max={eval_max_eps[-1]:.6e}, mean={eval_mean_eps[-1]:.6e}\n")
         f.write(f"Saved Q tables: {qpath}\n")
+        f.write(f"State visits CSV: {visits_csv}\n")
+        f.write(f"Number of visited states: {visit_stats['total_states']}\n")
+        f.write(
+            "Visits max / min / mean: "
+            f"{visit_stats['max_visits']} / {visit_stats['min_visits']} / {visit_stats['mean_visits']:.3f}\n"
+        )
         f.write(f"Nash exploitability report: {report_path}\n")
         f.write(f"Policy drift CSV: {drift_csv}\n")
+
+        f.write("\nTop 10 most visited states (Ay,Ax),(By,Bx),ball -> visits:\n")
+        for row in visit_stats["top_most"][:10]:
+            f.write(
+                f"  ({row['Ay']},{row['Ax']}),({row['By']},{row['Bx']}),ball={row['ball']} -> {row['visits']}\n"
+            )
+
+        f.write("\nTop 10 least visited states (Ay,Ax),(By,Bx),ball -> visits:\n")
+        for row in visit_stats["top_least"][:10]:
+            f.write(
+                f"  ({row['Ay']},{row['Ax']}),({row['By']},{row['Bx']}),ball={row['ball']} -> {row['visits']}\n"
+            )
 
 
 if __name__ == "__main__":
