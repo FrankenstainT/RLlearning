@@ -980,7 +980,10 @@ def main():
     episode_lengths = []
     disc_returns = []
     eps_sched = []  # we'll log ε of the initial state each episode (for plots)
-
+    v_max_deltas = []
+    v_mean_deltas = []
+    # start with an empty previous V snapshot
+    prev_V = {}
     # --- policy drift trackers ---
     policy_drift_rows = []
     prev_snapshot = learner.snapshot_policies()
@@ -1034,6 +1037,23 @@ def main():
                     episode_lengths.append(t)
                     disc_returns.append(G)
                     break
+            # --- after episode: track V drift over all known states ---
+            cur_V = learner.V  # dict: State -> float
+            deltas = []
+            for s, v_now in cur_V.items():
+                v_prev = prev_V.get(s, 0.0)
+                deltas.append(abs(v_now - v_prev))
+            # handle case when still very few states
+            if deltas:
+                v_max = max(deltas)
+                v_mean = sum(deltas) / len(deltas)
+            else:
+                v_max = 0.0
+                v_mean = 0.0
+            v_max_deltas.append(v_max)
+            v_mean_deltas.append(v_mean)
+            # update snapshot for next episode
+            prev_V = {s: cur_V[s] for s in cur_V}
 
             # --- policy drift (L1 / TV) between episodes ---
             drift = learner.policy_drift(prev_snapshot)
@@ -1077,9 +1097,14 @@ def main():
 
             ep += 1
             if (ep % 5000) == 0:
-                last = disc_returns[-5000:] if len(disc_returns) >= 5000 else disc_returns
-                print(f"Episode {ep}: avg discounted return (last block) = {np.mean(last):.4f}, "
-                      f"ΔQ_max_last={learner.episode_deltas[-1]:.3e}, eps0≈{eps_sched[-1]:.3f}")
+                # latest episode-level signals
+                last_v_max = v_max_deltas[-1] if v_max_deltas else 0.0
+                last_v_mean = v_mean_deltas[-1] if v_mean_deltas else 0.0
+                last_q_max = learner.episode_deltas[-1] if learner.episode_deltas else 0.0
+                print(
+                    f"Episode {ep}: ΔV_max={last_v_max:.3e}, ΔV_mean={last_v_mean:.3e}, "
+                    f"ΔQ_max={last_q_max:.3e}, eps0≈{eps_sched[-1]:.3f}"
+                )
 
     qpath = os.path.join(outdir, "nash_q_tables.pkl")
     save_q_tables_pickle(learner, qpath)
@@ -1154,6 +1179,23 @@ def main():
     plot_and_save(xs, [r["l1_B_max"] for r in policy_drift_rows],
                   "Policy Drift — L1 max (B)", "Episode", "L1_max(B)",
                   os.path.join(outdir, "policy_drift_l1_max_B.png"))
+    plot_and_save(
+        range(1, len(v_max_deltas) + 1),
+        v_max_deltas,
+        "Per-episode Max |ΔV|",
+        "Episode",
+        "max |ΔV|",
+        os.path.join(outdir, "v_convergence_max.png"),
+    )
+
+    plot_and_save(
+        range(1, len(v_mean_deltas) + 1),
+        v_mean_deltas,
+        "Per-episode Mean |ΔV|",
+        "Episode",
+        "mean |ΔV|",
+        os.path.join(outdir, "v_convergence_mean.png"),
+    )
 
     # if eval_points:
     #     plot_and_save(eval_points, eval_max_eps,
