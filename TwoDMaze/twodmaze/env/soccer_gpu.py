@@ -357,8 +357,8 @@ def project_simplex_torch(z: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def solve_zero_sum_torch_fast(M_np: np.ndarray,
-                              max_iters: int = 4000,
-                              lr: float = 0.3,
+                              max_iters: int = 800,
+                              lr: float = 0.35,
                               tol_v: float = 1e-5):
     """
     Approximate zero-sum solver on GPU/torch.
@@ -405,18 +405,36 @@ def solve_zero_sum_torch_fast(M_np: np.ndarray,
 # ============================================================
 #     UNIFIED GAME SOLVER
 # ============================================================
+# set to True after we announce that we're using torch to solve stage games
+_SOLVE_GAME_TORCH_ANNOUNCED = False
+
 def solve_game(M: np.ndarray):
     """
     Try GPU/torch first (if CUDA/MPS present), else CPU LP.
+    Print once if we actually use torch.
     """
-    # if we have a real GPU, use it
+    global _SOLVE_GAME_TORCH_ANNOUNCED
+
+    # CUDA first
     if torch.cuda.is_available():
+        if not _SOLVE_GAME_TORCH_ANNOUNCED:
+            print("[solve_game] using TORCH solver on CUDA")
+            _SOLVE_GAME_TORCH_ANNOUNCED = True
         return solve_zero_sum_torch_fast(M)
-    # if we have MPS, we can also try it (optional)
+
+    # MPS fallback (Apple)
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        if not _SOLVE_GAME_TORCH_ANNOUNCED:
+            print("[solve_game] using TORCH solver on MPS")
+            _SOLVE_GAME_TORCH_ANNOUNCED = True
         return solve_zero_sum_torch_fast(M)
-    # else fall back to exact CPU LP
+
+    # otherwise CPU LP
+    if not _SOLVE_GAME_TORCH_ANNOUNCED:
+        print("[solve_game] using CPU LP solver (scipy.linprog)")
+        _SOLVE_GAME_TORCH_ANNOUNCED = True
     return solve_both_policies_one_lp(M)
+
 
 # ============================================================
 #     SHAPLEY VALUE ITERATION (EXPECTATION OVER ORDERS)
