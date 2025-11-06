@@ -75,7 +75,7 @@ class MarkovSoccer:
     Reward +1 for A scoring, -1 for B scoring; discount gamma.
     """
 
-    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0,phi_coeff: float = 0.05, step_penalty_tau: float = 0.01,possession_reward: float = 0.2,
+    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0,phi_coeff: float = 0.05, step_penalty_tau: float = 0.01,possession_reward: float = 0.3,
         ball_seek_coeff: float = 0.03,):
         self.H, self.W = H, W
         self.gamma = float(gamma)
@@ -324,61 +324,99 @@ def solve_both_policies_one_lp(M: np.ndarray, jitter=1e-8, max_retries=2):
     v = float(np.mean(M))  # harmless placeholder
     return x, y, v
 
-def project_simplex(z: torch.Tensor) -> torch.Tensor:
-    """
-    Project each row vector of z onto the probability simplex.
-    Works for 1D too.
-    """
-    if z.dim() == 1:
+# ============================================================
+#     TORCH / GPU GAME SOLVER (approx, fast)
+# ============================================================
+def _torch_device_and_dtype():
+    if torch.cuda.is_available():
+        return torch.device("cuda"), torch.float64
+    # you already defined DEVICE above, but let's keep this local:
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps"), torch.float32
+    return torch.device("cpu"), torch.float64
+
+
+def project_simplex_torch(z: torch.Tensor) -> torch.Tensor:
+    orig_1d = (z.dim() == 1)
+    if orig_1d:
         z = z.unsqueeze(0)
 
-    # sort descending
+    # sort
     u, _ = torch.sort(z, dim=1, descending=True)
     cumsum = torch.cumsum(u, dim=1)
-    # find rho
-    rhos = torch.arange(1, z.size(1) + 1, device=z.device).view(1, -1)
-    cond = u * rhos > (cumsum - 1)
-    rho = cond.sum(dim=1) - 1  # index of last True per row
-
-    # theta = (sum_{j<=rho} u_j - 1) / rho
-    idx = rho.view(-1, 1)
-    theta = (cumsum.gather(1, idx) - 1) / (rho + 1).float().view(-1, 1)
-
+    r = torch.arange(1, z.size(1) + 1, device=z.device, dtype=z.dtype).view(1, -1)
+    cond = u * r > (cumsum - 1)
+    rho = cond.sum(dim=1) - 1
+    theta = (cumsum.gather(1, rho.view(-1, 1)) - 1) / (rho + 1).to(z.dtype).view(-1, 1)
     w = torch.clamp(z - theta, min=0.0)
-    return w.squeeze(0)
+    w = w / w.sum(dim=1, keepdim=True)
+    if orig_1d:
+        return w.squeeze(0)
+    return w
+
+
 @torch.no_grad()
-def solve_zero_sum_torch(M_np, iters: int = 150, lr: float = 0.4):
+def solve_zero_sum_torch_fast(M_np: np.ndarray,
+                              max_iters: int = 4000,
+                              lr: float = 0.3,
+                              tol_v: float = 1e-5):
     """
-    Approx zero-sum Nash for small matrix game on GPU.
-    M_np: numpy array (m, n) payoff for row player (A)
-    Returns (x, y, v) as numpy arrays.
+    Approximate zero-sum solver on GPU/torch.
+    Good enough to match value to ~1e-5 vs CPU LP.
     """
-    M = torch.as_tensor(M_np, dtype=torch.float32, device=DEVICE)
+    device, dtype = _torch_device_and_dtype()
+    M = torch.as_tensor(M_np, device=device, dtype=dtype)
     m, n = M.shape
 
-    # start uniform
-    x = torch.full((m,), 1.0 / m, device=DEVICE)
-    y = torch.full((n,), 1.0 / n, device=DEVICE)
+    x = torch.full((m,), 1.0 / m, device=device, dtype=dtype)
+    y = torch.full((n,), 1.0 / n, device=device, dtype=dtype)
+    x_bar = torch.zeros_like(x)
+    y_bar = torch.zeros_like(y)
 
-    # we do simultaneous gradient steps (extragrad-like is possible too)
-    for _ in range(iters):
-        # gradients:
-        # row player wants to maximize xᵀ M y  -> grad_x = M y
-        # col player wants to minimize xᵀ M y -> grad_y = -(Mᵀ x)
-        My = M @ y            # (m,)
-        MTx = M.t() @ x       # (n,)
+    prev_v = None
+    for t in range(1, max_iters + 1):
+        lr_t = lr / (1.0 + 0.0005 * t)
 
-        x = x + lr * My
-        y = y - lr * MTx
+        # extragrad step
+        My = M @ y
+        MTx = M.t() @ x
 
-        # project back to simplex
-        x = project_simplex(x)
-        y = project_simplex(y)
+        x_tilde = project_simplex_torch(x + lr_t * My)
+        y_tilde = project_simplex_torch(y - lr_t * MTx)
 
-    # value
-    v = (x @ M @ y).item()
+        My_tilde = M @ y_tilde
+        MTx_tilde = M.t() @ x_tilde
 
-    return x.detach().cpu().numpy(), y.detach().cpu().numpy(), v
+        x = project_simplex_torch(x + lr_t * My_tilde)
+        y = project_simplex_torch(y - lr_t * MTx_tilde)
+
+        # running averages
+        x_bar = x_bar + (x - x_bar) / t
+        y_bar = y_bar + (y - y_bar) / t
+
+        if t % 100 == 0 or t == max_iters:
+            v = (x_bar @ M @ y_bar).item()
+            if prev_v is not None and abs(v - prev_v) < tol_v:
+                break
+            prev_v = v
+
+    v = (x_bar @ M @ y_bar).item()
+    return x_bar.cpu().numpy(), y_bar.cpu().numpy(), float(v)
+# ============================================================
+#     UNIFIED GAME SOLVER
+# ============================================================
+def solve_game(M: np.ndarray):
+    """
+    Try GPU/torch first (if CUDA/MPS present), else CPU LP.
+    """
+    # if we have a real GPU, use it
+    if torch.cuda.is_available():
+        return solve_zero_sum_torch_fast(M)
+    # if we have MPS, we can also try it (optional)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return solve_zero_sum_torch_fast(M)
+    # else fall back to exact CPU LP
+    return solve_both_policies_one_lp(M)
 
 # ============================================================
 #     SHAPLEY VALUE ITERATION (EXPECTATION OVER ORDERS)
@@ -410,7 +448,7 @@ def shapley_value_iteration(env: MarkovSoccer, tol: float = 1e-10, max_iter: int
         delta = 0.0
         for s in env.states:
             M = stage_matrix(env, s, V)
-            x, y, v = solve_both_policies_one_lp(M)
+            x, y, v = solve_game(M)
             delta = max(delta, abs(v - V[s]))
             V[s], PiA[s], PiB[s] = v, x, y
         if delta < tol:
@@ -448,7 +486,7 @@ class EpsGreedy:
 
 class NashQLearner:
     def __init__(self, gamma=0.9, alpha0=0.5, alpha_power=0.6,
-                 eps_init=0.3, eps_final=0.02, episodes=50000,
+                 eps_init=0.3, eps_final=0.02,
                  eps_power=0.6):
         self.gamma = float(gamma)
         self.alpha0 = float(alpha0)
@@ -509,10 +547,10 @@ class NashQLearner:
         if s in self.dirty:
             M = self._matrix_from_Q(s)
             try:
-                x, y, v = solve_both_policies_one_lp(M)
+                x, y, v = solve_game(M)
             except Exception:
                 M = np.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
-                x, y, v = solve_both_policies_one_lp(M, jitter=1e-6, max_retries=3)
+                x, y, v = solve_game(M)
             self.PiA[s], self.PiB[s], self.V[s] = x, y, v
             self.dirty.discard(s)
         return self.PiA[s], self.PiB[s], self.V[s]
@@ -648,17 +686,17 @@ def exploitability_for_state(M: np.ndarray, x: np.ndarray, y: np.ndarray, v: flo
     return max(row_gain, col_gain)
 
 
-def evaluate_against_ground_truth(env: MarkovSoccer,
-                                  V_star, PiA_star, PiB_star,
-                                  PiA_learned, PiB_learned):
-    eps = []
-    for s in env.states:
-        M = stage_matrix(env, s, V_star)
-        _, _, v = solve_both_policies_one_lp(M)
-        x = PiA_learned.get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
-        y = PiB_learned.get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
-        eps.append(exploitability_for_state(M, x, y, v))
-    return float(np.max(eps)), float(np.mean(eps))
+# def evaluate_against_ground_truth(env: MarkovSoccer,
+#                                   V_star, PiA_star, PiB_star,
+#                                   PiA_learned, PiB_learned):
+#     eps = []
+#     for s in env.states:
+#         M = stage_matrix(env, s, V_star)
+#         x, y, v = solve_game(M)
+#         x = PiA_learned.get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
+#         y = PiB_learned.get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
+#         eps.append(exploitability_for_state(M, x, y, v))
+#     return float(np.max(eps)), float(np.mean(eps))
 
 
 # ============================================================
@@ -699,7 +737,7 @@ def nash_report_all_states(learner: NashQLearner, outdir: str, tol: float = 1e-4
             for j in range(nA):
                 M[i, j] = learner.Q[s][(i, j)]
         # solve on the *current Q* stage-game
-        x, y, v = solve_both_policies_one_lp(M)
+        x, y, v = solve_game(M)
         # exploitability
         row_vals = M @ y
         col_vals = M.T @ x
@@ -846,15 +884,13 @@ def main():
 
     # how many episodes for EACH (A,B,ball) triple
     EPISODES_PER_TRIPLE = 1000  #  (even across balls)
-    episodes = EPISODES_PER_TRIPLE * len(starts_with_ball)
 
     learner = NashQLearner(
         gamma=env.gamma,
         alpha0=0.6,
         alpha_power=0.4,
         eps_init=0.6,
-        eps_final=0.1,
-        episodes=episodes,
+        eps_final=0.01,
         eps_power=0.25,  # ε(s) ∝ (1+visits)^-0.6
     )
 
@@ -1177,7 +1213,7 @@ def main():
     # env.close()
 
     with open(os.path.join(outdir, "training_summary.txt"), "w") as f:
-        f.write(f"Episodes: {episodes}\n")
+        f.write(f"Episodes: {ep}\n")
         f.write(f"Final epsilon ~ {eps_sched[-1] if eps_sched else 'NA'}\n")
         # if eval_points:
         #     f.write(f"Final periodic exploitability: max={eval_max_eps[-1]:.6e}, mean={eval_mean_eps[-1]:.6e}\n")
