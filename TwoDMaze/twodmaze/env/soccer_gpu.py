@@ -433,7 +433,11 @@ def solve_game(M: np.ndarray):
     Returns (x, y, v).
     """
     global _SOLVE_GAME_TORCH_ANNOUNCED
-
+    # fallback: exact CPU LP
+    if not _SOLVE_GAME_TORCH_ANNOUNCED:
+        print("[solve_game] using CPU LP solver (scipy.linprog)")
+        _SOLVE_GAME_TORCH_ANNOUNCED = True
+    return solve_both_policies_one_lp(M)
     has_torch_accel = (
         torch.cuda.is_available()
         or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
@@ -445,11 +449,7 @@ def solve_game(M: np.ndarray):
             _SOLVE_GAME_TORCH_ANNOUNCED = True
         return zero_sum_saddle_extragrad_single(M)
 
-    # fallback: exact CPU LP
-    if not _SOLVE_GAME_TORCH_ANNOUNCED:
-        print("[solve_game] using CPU LP solver (scipy.linprog)")
-        _SOLVE_GAME_TORCH_ANNOUNCED = True
-    return solve_both_policies_one_lp(M)
+
 
 
 
