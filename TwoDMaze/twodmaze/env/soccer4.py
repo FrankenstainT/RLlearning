@@ -17,8 +17,13 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #                  ACTIONS / UTILS
 # ============================================================
 
-ACTIONS = ["N", "S", "W", "E", "Stay"]
-DIR = {"N": (-1, 0), "S": (1, 0), "W": (0, -1), "E": (0, 1), "Stay": (0, 0)}
+ACTIONS = ["N", "S", "W", "E"]
+DIR = {
+    "N": (-1, 0),
+    "S": (1, 0),
+    "W": (0, -1),
+    "E": (0, 1),
+}
 
 
 def ensure_dir(path: str):
@@ -213,12 +218,79 @@ class MarkovSoccer:
         r += self.gamma * self.potential(ns) - self.potential(s)
         return ns, r, False
 
-    # ----- stochastic one-step: random order 50/50 -----
-    def step_det_random(self, s: State, aA: str, aB: str):
-        if self.rng.random() < 0.5:
-            return self.step_seq(s, aA, aB, "AB")
+    def step(self, s: State, aA: str, aB: str):
+        Ay, Ax, By, Bx, ball = s.Ay, s.Ax, s.By, s.Bx, s.ball
+
+        # 1) scoring attempt first
+        r, done = self._score_check(s, aA, aB, ball)
+        if done:
+            return s, r, True
+
+        # 2) compute intended positions
+        A_ty, A_tx = self._apply_single(Ay, Ax, aA)
+        B_ty, B_tx = self._apply_single(By, Bx, aB)
+
+        # 3) if both intend to go to the SAME cell -> use random order (old logic)
+        if (A_ty, A_tx) == (B_ty, B_tx):
+            if self.rng.random() < 0.5:
+                return self.step_seq(s, aA, aB, "AB")
+            else:
+                return self.step_seq(s, aA, aB, "BA")
+
+        # 4) if they try to SWAP positions -> both blocked, ball redistrib randomly
+        if (A_ty, A_tx) == (By, Bx) and (B_ty, B_tx) == (Ay, Ax):
+            # both blocked
+            new_ball = 0 if self.rng.random() < 0.5 else 1
+            ns = State(Ay, Ax, By, Bx, new_ball)
+            r = 0.0
+
+            # possession swing shaping
+            if new_ball == 0 and ball == 1:
+                r += self.possession_reward
+            elif new_ball == 1 and ball == 0:
+                r -= self.possession_reward
+
+            # step penalty
+            if s.ball == 0:
+                r -= self.tau
+            else:
+                r += self.tau
+
+            # potential
+            #r += self.gamma * self.potential(ns) - self.potential(s)
+            return ns, r, False
+
+        # 5) otherwise: simultaneous move, keep both intended results
+        prev_dist_AB = abs(Ay - By) + abs(Ax - Bx)
+
+        A_new_y, A_new_x = A_ty, A_tx
+        B_new_y, B_new_x = B_ty, B_tx
+        new_ball = ball  # no change in this simple simultaneous branch
+
+        ns = State(A_new_y, A_new_x, B_new_y, B_new_x, new_ball)
+
+        # step penalty
+        if s.ball == 0:
+            r -= self.tau
         else:
-            return self.step_seq(s, aA, aB, "BA")
+            r += self.tau
+
+        # chase / separation shaping (no swing here)
+        new_dist_AB = abs(ns.Ay - ns.By) + abs(ns.Ax - ns.Bx)
+        if ns.ball == 1:
+            dist_improvement = prev_dist_AB - new_dist_AB
+            r += self.ball_seek_coeff * float(dist_improvement)
+        else:
+            dist_separation = new_dist_AB - prev_dist_AB
+            r += self.ball_seek_coeff * float(dist_separation)
+
+        # potential-based shaping
+        r += self.gamma * self.potential(ns) - self.potential(s)
+        return ns, r, False
+
+    # keep for old callers (we now just route to step)
+    def step_det_random(self, s: State, aA: str, aB: str):
+        return self.step(s, aA, aB)
 
     # def sample_start(self) -> State:
     #     # same positions; ball goes to A or B at random
@@ -924,7 +996,7 @@ def frames_to_gif_mp4(frames_dir: str, out_gif: str, out_mp4: str, fps: int = 3)
 # ============================================================
 
 def main():
-    outdir = "soccer_contrast_stat"
+    outdir = "soccer_stat_4"
     ensure_dir(outdir)
 
     big_drift_records = []
