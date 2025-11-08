@@ -1098,12 +1098,12 @@ def main():
     starts_with_ball.sort(key=lambda t: owner_goal_distance(env, t[0], t[1], t[2]))
 
     # how many episodes for EACH (A,B,ball) triple
-    EPISODES_PER_TRIPLE = 40  # (even across balls)
-    WATCH_EPISODE = 1_685_000
+    EPISODES_PER_TRIPLE = 64  # (even across balls)
+    WATCH_EPISODE = 1_405_000
     learner = NashQLearner(
         gamma=env.gamma,
         alpha0=0.6,
-        alpha_power=0.4,
+        alpha_power=0.5,
         eps_init=0.6,
         eps_final=0.001,
         eps_power=0.5,  # ε(s) ∝ (1+visits)^-0.6
