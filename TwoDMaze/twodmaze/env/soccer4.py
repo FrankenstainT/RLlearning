@@ -80,15 +80,16 @@ class MarkovSoccer:
     Reward +1 for A scoring, -1 for B scoring; discount gamma.
     """
 
-    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0,phi_coeff: float = 0.05, step_penalty_tau: float = 0.01,possession_reward: float = 0.3,
-        ball_seek_coeff: float = 0.03,):
+    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0, phi_coeff: float = 0.15,
+                 step_penalty_tau: float = 0.01, possession_reward: float = 0.3,
+                 ball_seek_coeff: float = 0.03, ):
         self.H, self.W = H, W
         self.gamma = float(gamma)
         self.rng = random.Random(seed)
         # canonical start positions; ball random each episode
         self.phi_coeff = float(phi_coeff)
         self.tau = float(step_penalty_tau)
-        #self._start_no_ball = State(Ay=2, Ax=1, By=1, Bx=3, ball=0)
+        # self._start_no_ball = State(Ay=2, Ax=1, By=1, Bx=3, ball=0)
         self.possession_reward = float(possession_reward)
         self.ball_seek_coeff = float(ball_seek_coeff)
         # enumerate all non-terminal distinct-cell states
@@ -257,7 +258,7 @@ class MarkovSoccer:
                 r += self.tau
 
             # potential
-            #r += self.gamma * self.potential(ns) - self.potential(s)
+            # r += self.gamma * self.potential(ns) - self.potential(s)
             return ns, r, False
 
         # 5) otherwise: simultaneous move, keep both intended results
@@ -432,10 +433,10 @@ def project_simplex_torch(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
 
 @torch.no_grad()
 def zero_sum_saddle_extragrad_single(
-    M_np: np.ndarray,
-    lr_list=(0.1, 0.05, 0.02),
-    max_steps=8000,
-    gap_tol=5e-5,
+        M_np: np.ndarray,
+        lr_list=(0.1, 0.05, 0.02),
+        max_steps=8000,
+        gap_tol=5e-5,
 ):
     """
     Solve a single zero-sum matrix game using mirror-prox/extragrad
@@ -456,8 +457,8 @@ def zero_sum_saddle_extragrad_single(
 
         for step in range(max_steps):
             # current payoffs
-            My = M @ y              # (m,)
-            xM = (x @ M).view(-1)    # (n,)
+            My = M @ y  # (m,)
+            xM = (x @ M).view(-1)  # (n,)
 
             # primal–dual gap
             row_best = My.max()
@@ -499,6 +500,7 @@ def zero_sum_saddle_extragrad_single(
 # ============================================================
 _SOLVE_GAME_TORCH_ANNOUNCED = False
 
+
 def solve_game(M: np.ndarray):
     """
     Try GPU/torch extragrad first (if available), else fall back to CPU LP.
@@ -511,8 +513,8 @@ def solve_game(M: np.ndarray):
         _SOLVE_GAME_TORCH_ANNOUNCED = True
     return solve_both_policies_one_lp(M)
     has_torch_accel = (
-        torch.cuda.is_available()
-        or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+            torch.cuda.is_available()
+            or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
     )
 
     if has_torch_accel:
@@ -520,9 +522,6 @@ def solve_game(M: np.ndarray):
             print("[solve_game] using TORCH extragrad solver")
             _SOLVE_GAME_TORCH_ANNOUNCED = True
         return zero_sum_saddle_extragrad_single(M)
-
-
-
 
 
 # ============================================================
@@ -822,6 +821,8 @@ def save_q_tables_pickle(learner: NashQLearner, outpath: str):
         mats[s] = M
     with open(outpath, "wb") as f:
         pickle.dump(mats, f)
+
+
 def save_state_visits_csv(learner: NashQLearner, outpath: str, top_k: int = 50):
     """
     Save per-state visit counts in a directly readable CSV.
@@ -877,72 +878,131 @@ def nash_report_all_states(learner: NashQLearner, outdir: str, tol: float = 1e-4
     For every state that appears in learner.Q:
       - build stage matrix from current Q
       - solve (x,y,v)
-      - compute exploitability ε
-    Saves a text report, returns a summary dict.
+      - record the exploration epsilon for that state
+      - record learning-rate stats over all joint actions in that state:
+            alpha_state_mean, alpha_state_max, alpha_state_min
     """
     ensure_dir(outdir)
     nA = len(ACTIONS)
-    worst = (-1.0, None, None, None)  # (eps, state, row_gain, col_gain)
-    eps_list = []
+
     lines = []
+    eps_list = []
+    alpha_mean_list = []
+    alpha_max_list = []
+    alpha_min_list = []
 
     for s in learner.Q.keys():
+        # rebuild stage matrix from Q
         M = np.zeros((nA, nA), float)
         for i in range(nA):
             for j in range(nA):
                 M[i, j] = learner.Q[s][(i, j)]
-        # solve on the *current Q* stage-game
         x, y, v = solve_game(M)
-        # exploitability
-        row_vals = M @ y
-        col_vals = M.T @ x
-        row_gain = float(row_vals.max() - v)
-        col_gain = float(v - col_vals.min())
-        eps = max(row_gain, col_gain)
 
-        eps_list.append(eps)
-        if eps > worst[0]:
-            worst = (eps, s, row_gain, col_gain)
+        # per-state epsilon
+        eps_s = learner._epsilon_for_state(s)
+        eps_list.append(eps_s)
+
+        # collect all alphas for this state
+        alphas_ij = []
+        for (i, j), vis_ij in learner.vis[s].items():
+            alpha_ij = learner.alpha0 / ((1.0 + vis_ij) ** learner.alpha_power)
+            alphas_ij.append(alpha_ij)
+
+        if alphas_ij:
+            alpha_state_mean = float(np.mean(alphas_ij))
+            alpha_state_max = float(np.max(alphas_ij))
+            alpha_state_min = float(np.min(alphas_ij))
+        else:
+            alpha_state_mean = 0.0
+            alpha_state_max = 0.0
+            alpha_state_min = 0.0
+
+        alpha_mean_list.append(alpha_state_mean)
+        alpha_max_list.append(alpha_state_max)
+        alpha_min_list.append(alpha_state_min)
+
         lines.append(
-            f"state={s}\n  v={v:.6g}  eps={eps:.3e}  row_gain={row_gain:.3e}  col_gain={col_gain:.3e}\n"
-            f"  x={np.round(x, 6)}\n  y={np.round(y, 6)}\n"
+            f"state={s}\n"
+            f"  v={v:.6g}\n"
+            f"  eps_explore={eps_s:.6g}\n"
+            f"  alpha_state_mean={alpha_state_mean:.6g}\n"
+            f"  alpha_state_max={alpha_state_max:.6g}\n"
+            f"  alpha_state_min={alpha_state_min:.6g}\n"
+            f"  x={np.round(x, 6)}\n"
+            f"  y={np.round(y, 6)}\n"
         )
 
+    # summary
     if eps_list:
-        arr = np.asarray(eps_list, float)
+        eps_arr = np.asarray(eps_list, float)
+        alpha_mean_arr = np.asarray(alpha_mean_list, float)
+        alpha_max_arr = np.asarray(alpha_max_list, float)
+        alpha_min_arr = np.asarray(alpha_min_list, float)
         summary = {
             "num_states": len(eps_list),
-            "eps_max": float(np.max(arr)),
-            "eps_mean": float(np.mean(arr)),
-            "eps_median": float(np.median(arr)),
-            "within_tol": int(np.sum(arr <= tol)),
+
+            "eps_explore_max": float(eps_arr.max()),
+            "eps_explore_min": float(eps_arr.min()),
+            "eps_explore_mean": float(eps_arr.mean()),
+            "eps_explore_median": float(np.median(eps_arr)),
+
+            "alpha_state_mean_max": float(alpha_mean_arr.max()),
+            "alpha_state_mean_min": float(alpha_mean_arr.min()),
+            "alpha_state_mean_mean": float(alpha_mean_arr.mean()),
+            "alpha_state_mean_median": float(np.median(alpha_mean_arr)),
+
+            "alpha_state_max_max": float(alpha_max_arr.max()),
+            "alpha_state_max_min": float(alpha_max_arr.min()),
+            "alpha_state_max_mean": float(alpha_max_arr.mean()),
+            "alpha_state_max_median": float(np.median(alpha_max_arr)),
+
+            "alpha_state_min_max": float(alpha_min_arr.max()),
+            "alpha_state_min_min": float(alpha_min_arr.min()),
+            "alpha_state_min_mean": float(alpha_min_arr.mean()),
+            "alpha_state_min_median": float(np.median(alpha_min_arr)),
+
             "tol": tol,
-            "worst_state": worst[1],
-            "worst_eps": worst[0],
-            "worst_row_gain": worst[2],
-            "worst_col_gain": worst[3],
         }
     else:
         summary = {
-            "num_states": 0, "eps_max": None, "eps_mean": None, "eps_median": None,
-            "within_tol": 0, "tol": tol, "worst_state": None, "worst_eps": None,
-            "worst_row_gain": None, "worst_col_gain": None,
+            "num_states": 0,
+            "eps_explore_max": None,
+            "eps_explore_min": None,
+            "eps_explore_mean": None,
+            "eps_explore_median": None,
+
+            "alpha_state_mean_max": None,
+            "alpha_state_mean_min": None,
+            "alpha_state_mean_mean": None,
+            "alpha_state_mean_median": None,
+
+            "alpha_state_max_max": None,
+            "alpha_state_max_min": None,
+            "alpha_state_max_mean": None,
+            "alpha_state_max_median": None,
+
+            "alpha_state_min_max": None,
+            "alpha_state_min_min": None,
+            "alpha_state_min_mean": None,
+            "alpha_state_min_median": None,
+
+            "tol": tol,
         }
 
-    # save text report
     report_path = os.path.join(outdir, "nash_exploitability_report.txt")
     with open(report_path, "w") as f:
-        f.write("Per-state ε-Nash (exploitability) report\n")
-        f.write(f"Tolerance: {tol}\n\n")
+        f.write("Per-state ε / learning-rate report (from current Q)\n")
+        f.write(f"Tolerance (kept for compatibility): {tol}\n\n")
         for ln in lines:
             f.write(ln + "\n")
         f.write("\n=== Summary ===\n")
         for k, v in summary.items():
             f.write(f"{k}: {v}\n")
 
-    # also print brief summary
     print("[Nash report]", summary)
     return summary, report_path
+
 
 
 def draw_frame(env: MarkovSoccer, s: State, step_idx: int, out_dir: str):
@@ -978,7 +1038,7 @@ def draw_frame(env: MarkovSoccer, s: State, step_idx: int, out_dir: str):
     return fname
 
 
-def frames_to_gif_mp4(frames_dir: str, out_gif: str, out_mp4: str, fps: int = 3):
+def frames_to_gif(frames_dir: str, out_gif: str, fps: int = 3):
     files = sorted([os.path.join(frames_dir, f) for f in os.listdir(frames_dir)
                     if f.lower().endswith(".png")])
     if not files:
@@ -986,9 +1046,9 @@ def frames_to_gif_mp4(frames_dir: str, out_gif: str, out_mp4: str, fps: int = 3)
         return
     imgs = [imageio.imread(f) for f in files]
     imageio.mimsave(out_gif, imgs, duration=1.0 / fps, loop=0, subrectangles=False)
-    imageio.mimsave(out_mp4, imgs, fps=fps, macro_block_size=None)
+    # imageio.mimsave(out_mp4, imgs, fps=fps, macro_block_size=None)
     print(f"Saved video: {out_gif}")
-    print(f"Saved video: {out_mp4}")
+    # print(f"Saved video: {out_mp4}")
 
 
 # ============================================================
@@ -1038,15 +1098,15 @@ def main():
     starts_with_ball.sort(key=lambda t: owner_goal_distance(env, t[0], t[1], t[2]))
 
     # how many episodes for EACH (A,B,ball) triple
-    EPISODES_PER_TRIPLE = 50  #  (even across balls)
+    EPISODES_PER_TRIPLE = 40  # (even across balls)
     WATCH_EPISODE = 1_685_000
     learner = NashQLearner(
         gamma=env.gamma,
         alpha0=0.6,
         alpha_power=0.4,
         eps_init=0.6,
-        eps_final=0.01,
-        eps_power=0.25,  # ε(s) ∝ (1+visits)^-0.6
+        eps_final=0.001,
+        eps_power=0.5,  # ε(s) ∝ (1+visits)^-0.6
     )
 
     episode_lengths = []
@@ -1059,6 +1119,7 @@ def main():
     # --- policy drift trackers ---
     policy_drift_rows = []
     prev_snapshot = learner.snapshot_policies()
+
     def is_corner(pos, H, W):
         y, x = pos
         return (y in (0, H - 1)) and (x in (0, W - 1))
@@ -1070,16 +1131,19 @@ def main():
     def start_weight(Apos, Bpos, H, W):
         # If any is corner -> strongest weighting
         if is_corner(Apos, H, W) and is_corner(Bpos, H, W):
-            return 320
-        if is_corner(Apos, H, W) and on_top_or_bottom_border(Bpos, H) or on_top_or_bottom_border(Apos, H) and is_corner(Bpos, H, W):
             return 160
+        if is_corner(Apos, H, W) and on_top_or_bottom_border(Bpos, H) or on_top_or_bottom_border(Apos, H) and is_corner(
+                Bpos, H, W):
+            return 100
         # Else if any is on top/bottom border -> medium weighting
-        if on_top_or_bottom_border(Apos, H) and on_top_or_bottom_border(Bpos, H) or is_corner(Apos, H, W) or is_corner(Bpos, H, W):
-            return 160
+        if on_top_or_bottom_border(Apos, H) and on_top_or_bottom_border(Bpos, H) or is_corner(Apos, H, W) or is_corner(
+                Bpos, H, W):
+            return 80
         if on_top_or_bottom_border(Apos, H) or on_top_or_bottom_border(Bpos, H):
-            return 40
+            return 20
         # Otherwise -> base
         return 1
+
     ep = 0
 
     for (Apos, Bpos, ball) in starts_with_ball:
@@ -1298,7 +1362,6 @@ def main():
         learner._solve(state)
         return learner.PiA[state], learner.PiB[state]
 
-
     max_steps_eval = 64
     eval_rows = []
     a_wins = b_wins = truncs = total_steps = 0
@@ -1337,23 +1400,26 @@ def main():
                 if done or step >= max_steps_eval:
                     if done:
                         if r > 0:
-                            winner = "A"; a_wins += 1
+                            winner = "A";
+                            a_wins += 1
                         elif r < 0:
-                            winner = "B"; b_wins += 1
+                            winner = "B";
+                            b_wins += 1
                         else:
                             winner = "Tie"
                     else:
-                        winner = "Trunc"; truncs += 1
+                        winner = "Trunc";
+                        truncs += 1
                     total_steps += step
                     break
 
             gif_path = os.path.join(frames_dir, f"{case_name}.gif")
-            mp4_path = os.path.join(frames_dir, f"{case_name}.mp4")
+            # mp4_path = os.path.join(frames_dir, f"{case_name}.mp4")
             try:
-                frames_to_gif_mp4(frames_dir, gif_path, mp4_path, fps=3)
+                frames_to_gif(frames_dir, gif_path, fps=3)
             except Exception as e:
                 print(f"[video export skipped for {case_name}] {e}")
-                gif_path, mp4_path = "", ""
+                gif_path = ""
 
             eval_rows.append({
                 "idx": idx,
@@ -1364,7 +1430,7 @@ def main():
                 "winner": winner,
                 "frames_dir": frames_dir,
                 "gif": gif_path,
-                "mp4": mp4_path,
+                # "mp4": mp4_path,
             })
 
             if (idx % 100) == 0:

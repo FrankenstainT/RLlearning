@@ -72,14 +72,15 @@ class MarkovSoccer:
     Reward +1 for A scoring, -1 for B scoring; discount gamma.
     """
 
-    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0,phi_coeff: float = 0.05, step_penalty_tau: float = 0.01):
+    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0, phi_coeff: float = 0.05,
+                 step_penalty_tau: float = 0.01):
         self.H, self.W = H, W
         self.gamma = float(gamma)
         self.rng = random.Random(seed)
         # canonical start positions; ball random each episode
         self.phi_coeff = float(phi_coeff)
         self.tau = float(step_penalty_tau)
-        #self._start_no_ball = State(Ay=2, Ax=1, By=1, Bx=3, ball=0)
+        # self._start_no_ball = State(Ay=2, Ax=1, By=1, Bx=3, ball=0)
 
         # enumerate all non-terminal distinct-cell states
         self.states: List[State] = []
@@ -717,7 +718,6 @@ def frames_to_gif_mp4(frames_dir: str, out_gif: str, out_mp4: str, fps: int = 3)
 # ============================================================
 
 def main():
-
     def all_distinct_starts(H: int, W: int) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
         """Return all (Ay,Ax),(By,Bx) with A!=B (no overlap)."""
         cells = [(y, x) for y in range(H) for x in range(W)]
@@ -736,10 +736,11 @@ def main():
         starts_with_ball.append((Apos, Bpos, 1))  # ball to B
 
     # sort ascending by distance(owner → goal)
-    #starts_with_ball.sort(key=lambda t: owner_goal_distance(env, t[0], t[1], t[2]))
+    # starts_with_ball.sort(key=lambda t: owner_goal_distance(env, t[0], t[1], t[2]))
 
     # how many episodes for EACH (A,B,ball) triple
-    EPISODES_PER_TRIPLE = 1000  #  (even across balls)
+    EPISODES_PER_TRIPLE = 50  # (even across balls)
+
     def is_corner(pos, H, W):
         y, x = pos
         return (y in (0, H - 1)) and (x in (0, W - 1))
@@ -751,26 +752,28 @@ def main():
     def start_weight(Apos, Bpos, H, W):
         # If any is corner -> strongest weighting
         if is_corner(Apos, H, W) and is_corner(Bpos, H, W):
-            return 16
+            return 320
         if is_corner(Apos, H, W) and on_top_or_bottom_border(Bpos, H) or on_top_or_bottom_border(Apos, H) and is_corner(Bpos, H, W):
-            return 8
+            return 160
         # Else if any is on top/bottom border -> medium weighting
         if on_top_or_bottom_border(Apos, H) and on_top_or_bottom_border(Bpos, H) or is_corner(Apos, H, W) or is_corner(Bpos, H, W):
-            return 4
+            return 160
         if on_top_or_bottom_border(Apos, H) or on_top_or_bottom_border(Bpos, H):
-            return 2
+            return 40
         # Otherwise -> base
         return 1
+
     repeats_sum = 0
-    mult_count = {1:0,2:0,4:0,8:0,16:0}
+    mult_count = {1: 0, 40: 0, 320: 0, 160: 0}
     for (Apos, Bpos, ball) in starts_with_ball:
         mult = start_weight(Apos, Bpos, 4, 5)
         repeats = EPISODES_PER_TRIPLE * mult
-        repeats_sum+= repeats
+        repeats_sum += repeats
         mult_count[mult] += 1
     print(repeats_sum)
     for k, v in mult_count.items():
         print(f"{k}:{v}")
+
 
 if __name__ == "__main__":
     main()
