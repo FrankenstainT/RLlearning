@@ -80,8 +80,8 @@ class MarkovSoccer:
     Reward +1 for A scoring, -1 for B scoring; discount gamma.
     """
 
-    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0, phi_coeff: float = 0.15,
-                 step_penalty_tau: float = 0.01, possession_reward: float = 0.3,
+    def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0, phi_coeff: float = 0.08,
+                 step_penalty_tau: float = 0.04, possession_reward: float = 0.4,
                  ball_seek_coeff: float = 0.03, ):
         self.H, self.W = H, W
         self.gamma = float(gamma)
@@ -1103,7 +1103,7 @@ def main():
     learner = NashQLearner(
         gamma=env.gamma,
         alpha0=0.6,
-        alpha_power=0.5,
+        alpha_power=0.45,
         eps_init=0.6,
         eps_final=0.001,
         eps_power=0.5,  # ε(s) ∝ (1+visits)^-0.6
