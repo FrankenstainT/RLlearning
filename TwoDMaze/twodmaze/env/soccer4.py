@@ -81,7 +81,7 @@ class MarkovSoccer:
     """
 
     def __init__(self, H: int = 4, W: int = 5, gamma: float = 0.9, seed: int = 0, phi_coeff: float = 0.08,
-                 step_penalty_tau: float = 0.04, possession_reward: float = 0.4,
+                 step_penalty_tau: float = 0.06, possession_reward: float = 0.5,
                  ball_seek_coeff: float = 0.03, ):
         self.H, self.W = H, W
         self.gamma = float(gamma)
@@ -1099,16 +1099,46 @@ def main():
 
     # how many episodes for EACH (A,B,ball) triple
     EPISODES_PER_TRIPLE = 64  # (even across balls)
-    WATCH_EPISODE = 1_405_000
+    WATCH_EPISODE = 2_105_000
     learner = NashQLearner(
         gamma=env.gamma,
         alpha0=0.6,
-        alpha_power=0.45,
+        alpha_power=0.55,
         eps_init=0.6,
         eps_final=0.001,
         eps_power=0.5,  # ε(s) ∝ (1+visits)^-0.6
     )
 
+    run_params = {
+        # env params
+        "H": env.H,
+        "W": env.W,
+        "gamma": env.gamma,
+        "phi_coeff": env.phi_coeff,
+        "step_penalty_tau": env.tau,
+        "possession_reward": env.possession_reward,
+        "ball_seek_coeff": env.ball_seek_coeff,
+
+        # learner params
+        "alpha0": learner.alpha0,
+        "alpha_power": learner.alpha_power,
+        "eps_init": learner.eps_init,
+        "eps_final": learner.eps_min,
+        "eps_power": learner.eps_power,
+
+        # training schedule
+        "EPISODES_PER_TRIPLE": EPISODES_PER_TRIPLE,
+        "WATCH_EPISODE": WATCH_EPISODE,
+
+        # bookkeeping
+        "outdir": outdir,
+        "seed_py_random": 0,
+        "seed_np": 0,
+    }
+    import json
+    # save as json so every run has a machine-readable copy
+    with open(os.path.join(outdir, "run_params.json"), "w") as f:
+        json.dump(run_params, f, indent=2)
     episode_lengths = []
     disc_returns = []
     eps_sched = []  # we'll log ε of the initial state each episode (for plots)
@@ -1490,7 +1520,9 @@ def main():
         )
         f.write(f"Nash exploitability report: {report_path}\n")
         f.write(f"Policy drift CSV: {drift_csv}\n")
-
+        f.write("\n=== Run parameters ===\n")
+        for k, v in run_params.items():
+            f.write(f"{k}: {v}\n")
         f.write("\nTop 10 most visited states (Ay,Ax),(By,Bx),ball -> visits:\n")
         for row in visit_stats["top_most"][:10]:
             f.write(
