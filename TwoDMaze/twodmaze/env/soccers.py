@@ -49,6 +49,12 @@ def moving_average(arr, win=100):
     return np.convolve(arr, kernel, mode="valid")
 
 
+def policy_entropy(p: np.ndarray) -> float:
+    p = np.asarray(p, float)
+    p = np.clip(p, 1e-12, 1.0)
+    return float(-(p * np.log(p)).sum())
+
+
 # ============================================================
 #                  ENV: MARKOV SOCCER (Sequential moves)
 # ============================================================
@@ -624,6 +630,9 @@ class NashQLearner:
         self._ep_max_delta = 0.0
 
         self.q_clip = 1.0 / max(1e-6, (1.0 - self.gamma))
+        self.ep_td_error_sum = 0.0
+        self.ep_td_error_count = 0
+        self.td_error_per_episode = []
 
     def _epsilon_for_state(self, s: State) -> float:
         n = self.state_visits.get(s, 0)
@@ -693,9 +702,13 @@ class NashQLearner:
         old_q = self.Q[s][(aA, aB)]
         alpha = self._alpha(s, aA, aB)
         # log alpha used on this update
-        self.ep_alpha_sum += alpha  # <--- NEW
+        self.ep_alpha_sum += alpha
         self.ep_alpha_count += 1
-        new_q = old_q + alpha * (target - old_q)
+        td_err = target - old_q  # The TD/Bellman error
+        self.ep_td_error_sum += abs(td_err)
+        self.ep_td_error_count += 1
+
+        new_q = old_q + alpha * td_err
 
         bound = self.q_clip
         new_q = float(np.clip(new_q, -bound, bound))
@@ -713,10 +726,14 @@ class NashQLearner:
         self.episode_deltas.append(self._ep_max_delta)
         # push mean alpha for this episode; guard div-by-zero
         mean_alpha = (self.ep_alpha_sum / self.ep_alpha_count) if self.ep_alpha_count else 0.0
-        self.alpha_per_episode.append(mean_alpha)  # <--- NEW
+        mean_td = (self.ep_td_error_sum / self.ep_td_error_count) if self.ep_td_error_count else 0.0
+        self.td_error_per_episode.append(mean_td)
+        self.alpha_per_episode.append(mean_alpha)
         # reset episode accumulators
-        self.ep_alpha_sum = 0.0  # <--- NEW
+        self.ep_alpha_sum = 0.0
         self.ep_alpha_count = 0
+        self.ep_td_error_sum = 0.0
+        self.ep_td_error_count = 0
         self._ep_max_delta = 0.0
 
     def snapshot_policies(self):
@@ -1004,30 +1021,62 @@ def nash_report_all_states(learner: NashQLearner, outdir: str, tol: float = 1e-4
     return summary, report_path
 
 
-
-def draw_frame(env: MarkovSoccer, s: State, step_idx: int, out_dir: str):
+def draw_frame(env: MarkovSoccer,
+               s: State,
+               step_idx: int,
+               out_dir: str,
+               piA: np.ndarray = None,
+               piB: np.ndarray = None):
     ensure_dir(out_dir)
     fig, ax = plt.subplots(figsize=(6, 5))
 
+    # grid
     for y in range(env.H + 1):
         ax.plot([-0.5, env.W - 0.5], [y - 0.5, y - 0.5], linewidth=0.5, color="gray")
     for x in range(env.W + 1):
         ax.plot([x - 0.5, x - 0.5], [-0.5, env.H - 0.5], linewidth=0.5, color="gray")
 
+    # goals
     ax.fill_betweenx([-0.5, env.H - 0.5], -1.0, -0.5, alpha=0.12, color="purple", label="B Goal (left)")
     ax.fill_betweenx([-0.5, env.H - 0.5], env.W - 0.5, env.W, alpha=0.12, color="green", label="A Goal (right)")
 
+    # players
     ax.plot([s.Ax], [s.Ay], marker='o', markersize=12, linestyle='None', label='A', color="tab:blue")
     ax.plot([s.Bx], [s.By], marker='s', markersize=12, linestyle='None', label='B', color="tab:red")
 
+    # ball
     by, bx = (s.Ay, s.Ax) if s.ball == 0 else (s.By, s.Bx)
     circ = plt.Circle((bx, by), radius=0.2, fill=False, linewidth=2.5, color="black")
     ax.add_patch(circ)
 
+    # ----- draw most likely actions as arrows -----
+    def _draw_arrow_at(x, y, action, color):
+        dy, dx = DIR[action]
+        # small arrow
+        ax.arrow(
+            x, y,
+            dx * 0.35, dy * 0.35,  # y inverted later, so negate dy
+            head_width=0.2,
+            head_length=0.2,
+            fc=color,
+            ec=color,
+            length_includes_head=True,
+        )
+
+    # if we have policies, show their argmax
+    if piA is not None:
+        aA = ACTIONS[int(np.argmax(piA))]
+        _draw_arrow_at(s.Ax, s.Ay, aA, "tab:blue")
+
+    if piB is not None:
+        aB = ACTIONS[int(np.argmax(piB))]
+        _draw_arrow_at(s.Bx, s.By, aB, "tab:red")
+    # ----- end -----
+
     ax.invert_yaxis()
-    ax.set_xlim([-0.6, env.W - 0.4]);
+    ax.set_xlim([-0.6, env.W - 0.4])
     ax.set_ylim([env.H - 0.6, -0.6])
-    ax.set_xticks(range(env.W));
+    ax.set_xticks(range(env.W))
     ax.set_yticks(range(env.H))
     ax.set_title(f"Greedy Evaluation — Step {step_idx}")
     ax.legend(loc="upper center", ncol=2, fontsize=8)
@@ -1036,7 +1085,6 @@ def draw_frame(env: MarkovSoccer, s: State, step_idx: int, out_dir: str):
     plt.savefig(fname)
     plt.close(fig)
     return fname
-
 
 def frames_to_gif(frames_dir: str, out_gif: str, fps: int = 3):
     files = sorted([os.path.join(frames_dir, f) for f in os.listdir(frames_dir)
@@ -1056,7 +1104,7 @@ def frames_to_gif(frames_dir: str, out_gif: str, fps: int = 3):
 # ============================================================
 
 def main():
-    outdir = "soccer_stat_4"
+    outdir = "soccers_stat"
     ensure_dir(outdir)
 
     big_drift_records = []
@@ -1064,7 +1112,7 @@ def main():
     np.random.seed(0)
     random.seed(0)
 
-    env = MarkovSoccer()  # 4x5, gamma=0.9
+    env = MarkovSoccer(gamma=0.95)  # simple, slightly longer horizon
 
     # print("Computing ground-truth Nash via Shapley value iteration...")
     # V_star, PiA_star, PiB_star = shapley_value_iteration(env, tol=1e-10, max_iter=2000)
@@ -1098,16 +1146,49 @@ def main():
     starts_with_ball.sort(key=lambda t: owner_goal_distance(env, t[0], t[1], t[2]))
 
     # how many episodes for EACH (A,B,ball) triple
-    EPISODES_PER_TRIPLE = 50  # (even across balls)
+    EPISODES_PER_TRIPLE = 64  # (even across balls)
     WATCH_EPISODE = 2_105_000
     learner = NashQLearner(
         gamma=env.gamma,
-        alpha0=0.6,
-        alpha_power=0.55,
-        eps_init=0.2,
-        eps_final=0.05,
-        eps_power=0.5,  # ε(s) ∝ (1+visits)^-0.6
+        alpha0=0.1,  # fixed LR ≈ 0.1
+        alpha_power=0.0,  # 0 => no decay, stays at 0.1
+        eps_init=0.2,  # start exploring at 0.2
+        eps_final=0.05,  # decay floor
+        eps_power=0.6,  # smooth decay as states get visited
     )
+
+    # ---- Q-value tracking for a few representative state–action pairs ----
+    tracked_q_pairs = [
+        # label, state, joint_action (aA_idx, aB_idx)
+        (
+            "s1_(3,4,3,3,1)_a(2,2)",
+            State(Ay=3, Ax=4, By=3, Bx=3, ball=1),
+            (2, 2),
+        ),
+        (
+            "s2_(3,2,2,3,1)_a(2,2)",
+            State(Ay=3, Ax=2, By=2, Bx=3, ball=1),
+            (2, 2),
+        ),
+        (
+            "s3_(0,3,1,4,0)_a(3,0)",
+            State(Ay=0, Ax=3, By=1, Bx=4, ball=0),
+            (3, 0),
+        ),
+    ]
+    # ---- policy tracking for a few fixed states ----
+    tracked_policy_states = [
+        ("pi_s1_(3,4,3,3,1)", State(Ay=3, Ax=4, By=3, Bx=3, ball=1)),
+        ("pi_s2_(3,2,2,3,1)", State(Ay=3, Ax=2, By=2, Bx=3, ball=1)),
+        ("pi_s3_(0,3,1,4,0)", State(Ay=0, Ax=3, By=1, Bx=4, ball=0)),
+    ]
+    # for each tracked state, we store 4 action-prob time series, for A and for B
+    policy_traces_A = {
+        label: {a: [] for a in ACTIONS} for (label, _) in tracked_policy_states
+    }
+    policy_traces_B = {
+        label: {a: [] for a in ACTIONS} for (label, _) in tracked_policy_states
+    }
 
     run_params = {
         # env params
@@ -1139,139 +1220,155 @@ def main():
     # save as json so every run has a machine-readable copy
     with open(os.path.join(outdir, "run_params.json"), "w") as f:
         json.dump(run_params, f, indent=2)
-    episode_lengths = []
-    disc_returns = []
-    eps_sched = []  # we'll log ε of the initial state each episode (for plots)
-    v_max_deltas = []
-    v_mean_deltas = []
-    # start with an empty previous V snapshot
-    prev_V = {}
-    # --- policy drift trackers ---
-    policy_drift_rows = []
-    prev_snapshot = learner.snapshot_policies()
-
-    def is_corner(pos, H, W):
-        y, x = pos
-        return (y in (0, H - 1)) and (x in (0, W - 1))
-
-    def on_top_or_bottom_border(pos, H):
-        y, _ = pos
-        return y in (0, H - 1)
-
-    def start_weight(Apos, Bpos, H, W):
-        # If any is corner -> strongest weighting
-        if is_corner(Apos, H, W) and is_corner(Bpos, H, W):
-            return 16
-        if is_corner(Apos, H, W) and on_top_or_bottom_border(Bpos, H) or on_top_or_bottom_border(Apos, H) and is_corner(
-                Bpos, H, W):
-            return 10
-        # Else if any is on top/bottom border -> medium weighting
-        if on_top_or_bottom_border(Apos, H) and on_top_or_bottom_border(Bpos, H) or is_corner(Apos, H, W) or is_corner(
-                Bpos, H, W):
-            return 8
-        if on_top_or_bottom_border(Apos, H) or on_top_or_bottom_border(Bpos, H):
-            return 2
-        # Otherwise -> base
-        return 1
+    # -----------------------------
+    # SIMPLE TRAINING LOOP
+    # -----------------------------
+    MAX_EPISODES = 70_000  # in the 30k–50k range you asked for
+    MAX_STEPS_PER_EP = 50
+    CHECKPOINT_EVERY = 10_000
 
     ep = 0
+    episode_rewards_A = []
+    episode_rewards_B = []
+    episode_lengths = []
+    episode_winners = []
+    eps_sched = []
+    v_max_deltas = []
+    v_mean_deltas = []
+    policy_entropy_A_per_ep = []
+    policy_entropy_B_per_ep = []
 
-    for (Apos, Bpos, ball) in starts_with_ball:
-        mult = start_weight(Apos, Bpos, env.H, env.W)
-        repeats = EPISODES_PER_TRIPLE * mult
-        for _rep in range(repeats):
-            Ay, Ax = Apos
-            By, Bx = Bpos
-            s = State(Ay=Ay, Ax=Ax, By=By, Bx=Bx, ball=ball)
+    # for drift tracking
+    prev_V = {}
+    policy_drift_rows = []
+    prev_snapshot = learner.snapshot_policies()
+    big_drift_records = []
 
-            learner.start(s)
-            # log the ε used at the episode start (for visualization)
-            eps_sched.append(learner._epsilon_for_state(s))
+    tracked_q_values = {label: [] for (label, _, _) in tracked_q_pairs}
+    tracked_q_episodes = []
 
-            G = 0.0
-            t = 0
-            while True:
-                aA_idx, aB_idx = learner.act()
-                aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
-                ns, r, done = env.step_det_random(s, aA, aB)
-                G += (env.gamma ** t) * r
-                learner.observe(ns, r, done)
-                s = ns
-                t += 1
-                if done or t > 100:
-                    learner.end_episode()
-                    episode_lengths.append(t)
-                    disc_returns.append(G)
-                    break
-            # --- after episode: track V drift over all known states ---
-            cur_V = learner.V  # dict: State -> float
-            deltas = []
-            for s, v_now in cur_V.items():
-                v_prev = prev_V.get(s, 0.0)
-                deltas.append(abs(v_now - v_prev))
-            # handle case when still very few states
-            if deltas:
-                v_max = max(deltas)
-                v_mean = sum(deltas) / len(deltas)
+    # helper to sample a legal random start
+    def sample_random_start(env: MarkovSoccer) -> State:
+        while True:
+            Ay = np.random.randint(env.H)
+            Ax = np.random.randint(env.W)
+            By = np.random.randint(env.H)
+            Bx = np.random.randint(env.W)
+            if (Ay, Ax) != (By, Bx):
+                ball = np.random.randint(2)  # 0 = A, 1 = B
+                return State(Ay=Ay, Ax=Ax, By=By, Bx=Bx, ball=ball)
+
+    while ep < MAX_EPISODES:
+        s = sample_random_start(env)
+        learner.start(s)
+        eps_sched.append(learner._epsilon_for_state(s))
+
+        ep_return_A = 0.0
+        t = 0
+        done = False
+
+        while not done and t < MAX_STEPS_PER_EP:
+            aA_idx, aB_idx = learner.act()
+            aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
+            ns, r, done = env.step_det_random(s, aA, aB)
+            ep_return_A += r
+            learner.observe(ns, r, done)
+            s = ns
+            t += 1
+
+        learner.end_episode()
+
+        episode_rewards_A.append(ep_return_A)
+        episode_rewards_B.append(-ep_return_A)
+        episode_lengths.append(t)
+
+        # winner tracking
+        if done:
+            if r > 0:
+                episode_winners.append("A")
+            elif r < 0:
+                episode_winners.append("B")
             else:
-                v_max = 0.0
-                v_mean = 0.0
-            v_max_deltas.append(v_max)
-            v_mean_deltas.append(v_mean)
-            # update snapshot for next episode
-            prev_V = {s: cur_V[s] for s in cur_V}
+                episode_winners.append("Trunc")
+        else:
+            episode_winners.append("Trunc")
 
-            # --- policy drift (L1 / TV) between episodes ---
-            drift = learner.policy_drift(prev_snapshot)
+        # ---- track a few Q-values
+        tracked_q_episodes.append(ep)
+        for (label, s_tr, (aA_i, aB_i)) in tracked_q_pairs:
+            learner._ensure(s_tr)
+            q_val = learner.Q[s_tr][(aA_i, aB_i)]
+            tracked_q_values[label].append(q_val)
 
-            if ep >= WATCH_EPISODE:
-                cur_snap = drift["current_snapshot"]  # {"A": {state: np.array}, "B": {...}}
-                prev_snap = prev_snapshot  # snapshot from previous episode
+        # ---- V drift
+        cur_V = learner.V
+        deltas = []
+        for s_v, v_now in cur_V.items():
+            v_prev = prev_V.get(s_v, 0.0)
+            deltas.append(abs(v_now - v_prev))
+        if deltas:
+            v_max_deltas.append(max(deltas))
+            v_mean_deltas.append(sum(deltas) / len(deltas))
+        else:
+            v_max_deltas.append(0.0)
+            v_mean_deltas.append(0.0)
+        prev_V = {s_v: cur_V[s_v] for s_v in cur_V}
 
-                for s, stats in drift["per_state"].items():
-                    la = stats["l1_A"]
-                    lb = stats["l1_B"]
-                    if la > 1.0 or lb > 1.0:
-                        # get policies now (after update)
-                        cur_piA = cur_snap["A"].get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
-                        cur_piB = cur_snap["B"].get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
+        # ---- policy drift (keep, since Nash-Q can wobble)
+        drift = learner.policy_drift(prev_snapshot)
+        prev_snapshot = drift["current_snapshot"]
+        policy_drift_rows.append({
+            "episode": ep,
+            "states": drift["agg"]["count"],
+            "l1_A_max": drift["agg"]["l1_A_max"], "l1_A_mean": drift["agg"]["l1_A_mean"],
+            "l1_B_max": drift["agg"]["l1_B_max"], "l1_B_mean": drift["agg"]["l1_B_mean"],
+            "tv_A_max": drift["agg"]["tv_A_max"], "tv_A_mean": drift["agg"]["tv_A_mean"],
+            "tv_B_max": drift["agg"]["tv_B_max"], "tv_B_mean": drift["agg"]["tv_B_mean"],
+        })
 
-                        # get policies before update
-                        prev_piA = prev_snap["A"].get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
-                        prev_piB = prev_snap["B"].get(s, np.ones(len(ACTIONS)) / len(ACTIONS))
+        # ---- policy entropy monitor
+        cur_snap = drift["current_snapshot"]
+        # ---- log equilibrium action probs for the selected states ----
+        # cur_snap has the up-to-date Nash policies for every state we've seen
+        for label, s_tr in tracked_policy_states:
+            # A's policy at this state (fallback to uniform if unseen)
+            if s_tr in cur_snap["A"]:
+                piA = cur_snap["A"][s_tr]
+            else:
+                piA = np.ones(len(ACTIONS)) / len(ACTIONS)
 
-                        big_drift_records.append({
-                            "episode": ep,
-                            "state": (s.Ay, s.Ax, s.By, s.Bx, s.ball),
-                            "l1_A": float(la),
-                            "l1_B": float(lb),
-                            "prev_piA": prev_piA.tolist(),
-                            "prev_piB": prev_piB.tolist(),
-                            "cur_piA": cur_piA.tolist(),
-                            "cur_piB": cur_piB.tolist(),
-                        })
+            # B's policy at this state
+            if s_tr in cur_snap["B"]:
+                piB = cur_snap["B"][s_tr]
+            else:
+                piB = np.ones(len(ACTIONS)) / len(ACTIONS)
 
-            prev_snapshot = drift["current_snapshot"]
-            policy_drift_rows.append({
-                "episode": ep,
-                "states": drift["agg"]["count"],
-                "l1_A_max": drift["agg"]["l1_A_max"], "l1_A_mean": drift["agg"]["l1_A_mean"],
-                "l1_B_max": drift["agg"]["l1_B_max"], "l1_B_mean": drift["agg"]["l1_B_mean"],
-                "tv_A_max": drift["agg"]["tv_A_max"], "tv_A_mean": drift["agg"]["tv_A_mean"],
-                "tv_B_max": drift["agg"]["tv_B_max"], "tv_B_mean": drift["agg"]["tv_B_mean"],
-            })
+            # append each action prob, in fixed ACTIONS order ["N","S","W","E"]
+            for act_idx, act in enumerate(ACTIONS):
+                policy_traces_A[label][act].append(float(piA[act_idx]))
+                policy_traces_B[label][act].append(float(piB[act_idx]))
 
-            ep += 1
-            if (ep % 5000) == 0:
-                # latest episode-level signals
-                last_v_max = v_max_deltas[-1] if v_max_deltas else 0.0
-                last_v_mean = v_mean_deltas[-1] if v_mean_deltas else 0.0
-                last_q_max = learner.episode_deltas[-1] if learner.episode_deltas else 0.0
-                print(
-                    f"Episode {ep}: ΔV_max={last_v_max:.3e}, ΔV_mean={last_v_mean:.3e}, "
-                    f"ΔQ_max={last_q_max:.3e}, eps0≈{eps_sched[-1]:.3f}"
-                )
+        ent_As = [policy_entropy(pA) for pA in cur_snap["A"].values()] or [0.0]
+        ent_Bs = [policy_entropy(pB) for pB in cur_snap["B"].values()] or [0.0]
+        policy_entropy_A_per_ep.append(float(np.mean(ent_As)))
+        policy_entropy_B_per_ep.append(float(np.mean(ent_Bs)))
 
+        # ---- periodic checkpoint
+        if (ep + 1) % CHECKPOINT_EVERY == 0:
+            ckpt_path = os.path.join(outdir, f"nash_q_tables_ep{ep + 1}.pkl")
+            save_q_tables_pickle(learner, ckpt_path)
+            print(f"[checkpoint] saved to {ckpt_path}")
+
+            # light console log
+            last_td = learner.td_error_per_episode[-1] if learner.td_error_per_episode else 0.0
+            last_v_max = v_max_deltas[-1] if v_max_deltas else 0.0
+            last_v_mean = v_mean_deltas[-1] if v_mean_deltas else 0.0
+            last_q_max = learner.episode_deltas[-1] if learner.episode_deltas else 0.0
+            print(f"Episode {ep + 1}/{MAX_EPISODES} | ΔV_max={last_v_max:.3e}, ΔV_mean={last_v_mean:.3e}, "
+                    f"ΔQ_max={last_q_max:.3e} | "
+                  f"len={t} | TD={last_td:.4f} | eps0={eps_sched[-1]:.3f}")
+
+        ep += 1
     qpath = os.path.join(outdir, "nash_q_tables.pkl")
     save_q_tables_pickle(learner, qpath)
     print(f"Saved Nash-Q tables to {qpath}")
@@ -1281,19 +1378,55 @@ def main():
     # -------- Nash exploitability report (print + save) --------
     summary, report_path = nash_report_all_states(learner, outdir=outdir, tol=1e-4)
     print(f"[saved] exploitability report -> {report_path}")
-
+    # TD error
+    plot_and_save(
+        range(1, len(learner.td_error_per_episode) + 1),
+        learner.td_error_per_episode,
+        "Mean TD Error per Episode",
+        "Episode",
+        "mean |TD|",
+        os.path.join(outdir, "td_error_per_episode.png"),
+    )
     plot_and_save(range(1, len(episode_lengths) + 1), episode_lengths,
                   "Episode Lengths", "Episode", "Steps",
                   os.path.join(outdir, "episode_lengths.png"))
 
-    plot_and_save(range(1, len(disc_returns) + 1), disc_returns,
-                  "Discounted Return per Episode", "Episode", "G",
-                  os.path.join(outdir, "discounted_return.png"))
+    plot_and_save(
+        range(1, len(episode_rewards_A) + 1),
+        episode_rewards_A,
+        "Episode Reward (A, accumulated)",
+        "Episode",
+        "Reward",
+        os.path.join(outdir, "episode_reward_A.png"),
+    )
 
-    ma = moving_average(disc_returns, 500)
-    plot_and_save(range(len(ma)), ma,
-                  "Discounted Return (Moving Average, 500)", "MA Index", "G (avg)",
-                  os.path.join(outdir, "discounted_return_ma500.png"))
+    plot_and_save(
+        range(1, len(episode_rewards_B) + 1),
+        episode_rewards_B,
+        "Episode Reward (B, accumulated)",
+        "Episode",
+        "Reward",
+        os.path.join(outdir, "episode_reward_B.png"),
+    )
+    ma_A = moving_average(episode_rewards_A, win=100)
+    plot_and_save(
+        range(len(ma_A)),
+        ma_A,
+        "Episode Reward (A) — MA=100",
+        "Episode",
+        "Reward",
+        os.path.join(outdir, "episode_reward_A_ma100.png"),
+    )
+
+    ma_B = moving_average(episode_rewards_B, win=100)
+    plot_and_save(
+        range(len(ma_B)),
+        ma_B,
+        "Episode Reward (B) — MA=100",
+        "Episode",
+        "Reward",
+        os.path.join(outdir, "episode_reward_B_ma100.png"),
+    )
 
     plot_and_save(range(1, len(learner.episode_deltas) + 1), learner.episode_deltas,
                   "Per-episode Max |ΔQ|", "Episode", "max |ΔQ|",
@@ -1305,7 +1438,19 @@ def main():
     plot_and_save(range(1, len(learner.alpha_per_episode) + 1), learner.alpha_per_episode,
                   "Learning Rate (alpha) per Episode", "Episode", "alpha",
                   os.path.join(outdir, "alpha_per_episode.png"))
-
+    # win rate (moving)
+    window = 500
+    wins_A = np.array([1 if w == "A" else 0 for w in episode_winners], float)
+    if len(wins_A) >= 5:
+        ma_wins_A = moving_average(wins_A, win=window)
+        plot_and_save(
+            range(len(ma_wins_A)),
+            ma_wins_A,
+            f"A win rate (MA={window})",
+            "Episode",
+            "win rate",
+            os.path.join(outdir, "win_rate_A.png"),
+        )
     # -------- Policy drift outputs --------
     import csv
     drift_csv = os.path.join(outdir, "policy_drift.csv")
@@ -1362,6 +1507,87 @@ def main():
         "mean |ΔV|",
         os.path.join(outdir, "v_convergence_mean.png"),
     )
+    # Policy entropy over training
+    if policy_entropy_A_per_ep:
+        plot_and_save(
+            range(1, len(policy_entropy_A_per_ep) + 1),
+            policy_entropy_A_per_ep,
+            "Average Policy Entropy — Player A",
+            "Episode",
+            "Entropy",
+            os.path.join(outdir, "policy_entropy_A.png"),
+        )
+
+    if policy_entropy_B_per_ep:
+        plot_and_save(
+            range(1, len(policy_entropy_B_per_ep) + 1),
+            policy_entropy_B_per_ep,
+            "Average Policy Entropy — Player B",
+            "Episode",
+            "Entropy",
+            os.path.join(outdir, "policy_entropy_B.png"),
+        )
+    window = 100
+    if policy_entropy_A_per_ep:
+        ma_ent_A = moving_average(policy_entropy_A_per_ep, win=window)
+        plot_and_save(
+            range(len(ma_ent_A)),
+            ma_ent_A,
+            f"Average Policy Entropy — Player A (MA={window})",
+            "Episode",
+            "Entropy",
+            os.path.join(outdir, f"policy_entropy_A_ma{window}.png"),
+        )
+    if policy_entropy_B_per_ep:
+        ma_ent_B = moving_average(policy_entropy_B_per_ep, win=window)
+        plot_and_save(
+            range(len(ma_ent_B)),
+            ma_ent_B,
+            f"Average Policy Entropy — Player B (MA={window})",
+            "Episode",
+            "Entropy",
+            os.path.join(outdir, f"policy_entropy_B_ma{window}.png"),
+        )
+
+    # ---- plot tracked Q-value evolution ----
+    for label, ys in tracked_q_values.items():
+        plot_and_save(
+            tracked_q_episodes,
+            ys,
+            f"Q-value evolution: {label}",
+            "Episode",
+            "Q(s,a)",
+            os.path.join(outdir, f"q_track_{label}.png"),
+        )
+    # ---- plot equilibrium action probs for tracked states ----
+    # x-axis is episodes; we used tracked_q_episodes as the per-episode index already
+    xs = tracked_q_episodes
+
+    for label, per_act_dict in policy_traces_A.items():
+        for a in ACTIONS:
+            ys = per_act_dict[a]
+            if ys:  # there should be, but guard anyway
+                plot_and_save(
+                    xs,
+                    ys,
+                    f"Equilibrium probs (A) — {label} — action {a}",
+                    "Episode",
+                    "Prob",
+                    os.path.join(outdir, f"pi_track_A_{label}_act-{a}.png"),
+                )
+
+    for label, per_act_dict in policy_traces_B.items():
+        for a in ACTIONS:
+            ys = per_act_dict[a]
+            if ys:
+                plot_and_save(
+                    xs,
+                    ys,
+                    f"Equilibrium probs (B) — {label} — action {a}",
+                    "Episode",
+                    "Prob",
+                    os.path.join(outdir, f"pi_track_B_{label}_act-{a}.png"),
+                )
 
     # if eval_points:
     #     plot_and_save(eval_points, eval_max_eps,
@@ -1403,7 +1629,7 @@ def main():
         for ball in (0, 1):  # <-- evaluate both A-ball and B-ball
             idx += 1
             s = State(Ay=Ay, Ax=Ax, By=By, Bx=Bx, ball=ball)
-            ensure_policy(s)
+            piA, piB = ensure_policy(s)
 
             case_name = f"eval_A({Ay},{Ax})_B({By},{Bx})_ball{'A' if ball == 0 else 'B'}"
             frames_dir = os.path.join(outdir, case_name)
@@ -1411,8 +1637,8 @@ def main():
 
             # rollout (ε = 0, sample from learned mixed policies)
             step = 0
-            discounted_return = 0.0
-            draw_frame(env, s, step, frames_dir)
+            final_return = 0.0
+            draw_frame(env, s, step, frames_dir, piA=piA, piB=piB)
 
             winner = "None"
             while True:
@@ -1422,10 +1648,11 @@ def main():
                 aA, aB = ACTIONS[aA_idx], ACTIONS[aB_idx]
 
                 ns, r, done = env.step_det_random(s, aA, aB)
-                discounted_return += (env.gamma ** step) * r
+                final_return += r
                 s = ns
                 step += 1
-                draw_frame(env, s, step, frames_dir)
+                piA_next, piB_next = ensure_policy(s)
+                draw_frame(env, s, step, frames_dir, piA=piA_next, piB=piB_next)
 
                 if done or step >= max_steps_eval:
                     if done:
@@ -1456,7 +1683,7 @@ def main():
                 "Ay": Ay, "Ax": Ax, "By": By, "Bx": Bx,
                 "ball": ball,  # 0 = A, 1 = B
                 "steps": step,
-                "discounted_return": discounted_return,
+                "final_return": final_return,
                 "winner": winner,
                 "frames_dir": frames_dir,
                 "gif": gif_path,
@@ -1503,14 +1730,60 @@ def main():
         plt.tight_layout()
         plt.savefig(os.path.join(outdir, "final_eval_steps_hist.png"))
         plt.close()
+        # Histogram of total (final) returns from eval episodes
+        eval_returns = [r["final_return"] for r in eval_rows]
+
+        plt.figure()
+        plt.hist(eval_returns, bins=30)
+        plt.title("Final Eval — Distribution of final Returns (A's perspective)")
+        plt.xlabel("final return")
+        plt.ylabel("Count")
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "final_eval_return_hist.png"))
+        plt.close()
+
     except Exception as e:
         print(f"[final eval plotting skipped] {e}")
+    # --- simple occupancy/value maps (4x5) for inspection ---
+    H, W = env.H, env.W
+    occ_A = np.zeros((H, W), float)
+    occ_B = np.zeros((H, W), float)
+    val_A_ball = np.full((H, W), np.nan)
+    val_B_ball = np.full((H, W), np.nan)
+
+    for s in learner.V.keys():
+        # count how often we ended up learning about this cell as A/B
+        occ_A[s.Ay, s.Ax] += 1.0
+        occ_B[s.By, s.Bx] += 1.0
+        if s.ball == 0:
+            # A has ball
+            cur = val_A_ball[s.Ay, s.Ax]
+            val_A_ball[s.Ay, s.Ax] = learner.V[s] if np.isnan(cur) else max(cur, learner.V[s])
+        else:
+            cur = val_B_ball[s.By, s.Bx]
+            val_B_ball[s.By, s.Bx] = learner.V[s] if np.isnan(cur) else max(cur, learner.V[s])
+
+    # plot them quickly
+    def save_grid_heatmap(arr, title, outname):
+        plt.figure()
+        plt.imshow(arr, origin="upper")
+        plt.colorbar()
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, outname))
+        plt.close()
+
+    save_grid_heatmap(occ_A, "A occupancy (learned states)", "occ_A.png")
+    save_grid_heatmap(occ_B, "B occupancy (learned states)", "occ_B.png")
+    save_grid_heatmap(val_A_ball, "Value map (A has ball)", "value_map_A_ball.png")
+    save_grid_heatmap(val_B_ball, "Value map (B has ball)", "value_map_B_ball.png")
 
     # env.close()
-
+    avg_len_all = (sum(episode_lengths) / len(episode_lengths)) if episode_lengths else 0.0
     with open(os.path.join(outdir, "training_summary.txt"), "w") as f:
         f.write(f"Episodes: {ep}\n")
         f.write(f"Final epsilon ~ {eps_sched[-1] if eps_sched else 'NA'}\n")
+        f.write(f"Avg episode length: {avg_len_all:.3f}\n")
         f.write(f"Saved Q tables: {qpath}\n")
         f.write(f"State visits CSV: {visits_csv}\n")
         f.write(f"Number of visited states: {visit_stats['total_states']}\n")
