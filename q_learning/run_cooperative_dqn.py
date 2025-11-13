@@ -397,7 +397,7 @@ def main():
     torch.manual_seed(42)
     
     # Create environment with two goals
-    env = CooperativeEnv(size=4, goal1=(0, 0), goal2=(3, 3))
+    env = CooperativeEnv(size=4, goal1=(0, 0), goal2=(0, 1))
     
     # Create cooperative DQN agent
     agent = CooperativeDQN(
@@ -418,7 +418,7 @@ def main():
         env, agent, num_episodes=30000, max_steps=50
     )
     
-    outdir = 'cooperative_results'
+    outdir = 'cooperative_results_01'
     
     # Plot training progress
     plot_training_progress(
