@@ -6,10 +6,9 @@ Visualization utilities for maze learning
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Any
 import os
 import imageio.v2 as imageio
-from maze_env import MazeEnv
 
 
 def moving_average(data: np.ndarray, window: int = 100) -> np.ndarray:
@@ -73,7 +72,7 @@ def plot_training_progress(episode_rewards: List[float], episode_lengths: List[i
     print(f"Saved training progress plots to {save_path}")
 
 
-def visualize_value_and_policy(env: MazeEnv, agent, save_path: str = 'results/value_and_policy.png'):
+def visualize_value_and_policy(env: Any, agent, save_path: str = 'results/value_and_policy.png'):
     """Visualize the learned value function and policy."""
     size = env.size
     
@@ -164,7 +163,7 @@ def visualize_value_and_policy(env: MazeEnv, agent, save_path: str = 'results/va
     print(f"Saved value function and policy visualization to {save_path}")
 
 
-def draw_frame(env: MazeEnv, state: Tuple[int, int], step_idx: int, 
+def draw_frame(env: Any, state: Tuple[int, int], step_idx: int, 
                out_dir: str, action: int = None):
     """Draw a single frame of the maze state."""
     os.makedirs(out_dir, exist_ok=True)
