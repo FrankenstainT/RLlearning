@@ -7,6 +7,7 @@ import numpy as np
 from typing import Tuple, List, Dict
 import sys
 import os
+import time
 # Add parent directory to path to import shared modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from competitive_env import CompetitiveEnv
@@ -68,6 +69,7 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
     prev_snapshot = None
     
     print(f"Training for {num_episodes} episodes...")
+    start_time = time.time()
     
     for episode in range(num_episodes):
         # Reset to random distinct positions
@@ -136,17 +138,17 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
         # Decay epsilon
         agent.decay_epsilon()
         
-        # Track policy entropy and drift
-        if episode % 100 == 0:  # Every 100 episodes
+        # Track policy entropy and drift (less frequently to save time)
+        if episode % 300 == 0:  # Every 500 episodes (reduced from 100)
             # Compute average policy entropy
             entropies = []
-            for state in all_states[:100]:  # Sample for efficiency
+            for state in all_states:  # Reduced sample size for efficiency
                 policy = agent.get_policy_distribution(state)
                 entropies.append(policy_entropy(policy))
             policy_entropies.append(np.mean(entropies))
             
             # Track value and policy drift
-            current_snapshot = agent.snapshot_policies_and_values(env, all_states[:100])
+            current_snapshot = agent.snapshot_policies_and_values(env, all_states)
             
             if prev_snapshot is not None:
                 # Value differences
@@ -180,12 +182,18 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
         
         if (episode + 1) % 1000 == 0:
             pursuer_wins = sum(1 for w in episode_winners[-1000:] if w == "Pursuer")
+            elapsed_time = time.time() - start_time
+            hours = int(elapsed_time // 3600)
+            minutes = int((elapsed_time % 3600) // 60)
+            seconds = int(elapsed_time % 60)
+            time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
             print(f"Episode {episode + 1}/{num_episodes} - "
                   f"Pursuer Avg Reward (last 100): {np.mean(pursuer_rewards[-100:]):.2f}, "
                   f"Evader Avg Reward (last 100): {np.mean(evader_rewards[-100:]):.2f}, "
                   f"Avg Steps: {np.mean(episode_lengths[-100:]):.2f}, "
                   f"Pursuer Win Rate (last 1000): {pursuer_wins/1000:.2%}, "
-                  f"Epsilon: {agent.epsilon:.4f}")
+                  f"Epsilon: {agent.epsilon:.4f}, "
+                  f"Time: {time_str}")
     
     return (pursuer_rewards, evader_rewards, episode_lengths, td_errors_per_episode,
             episode_winners, policy_entropies, value_diffs_max, value_diffs_mean, 
@@ -249,16 +257,16 @@ def plot_training_progress(pursuer_rewards: list, evader_rewards: list,
                      f"Pursuer Win Rate (MA={window})", "Episode", "Win Rate",
                      os.path.join(outdir, "win_rate.png"))
     
-    # Policy entropy
+    # Policy entropy (tracked every 300 episodes)
     if policy_entropies:
-        entropy_episodes = np.arange(0, len(policy_entropies)) * 100
+        entropy_episodes = np.arange(0, len(policy_entropies)) * 300
         plot_and_save(entropy_episodes, policy_entropies,
                      "Average Policy Entropy", "Episode", "Entropy",
                      os.path.join(outdir, "policy_entropy.png"))
     
-    # Value differences
+    # Value differences (tracked every 300 episodes)
     if value_diffs_max:
-        diff_episodes = np.arange(0, len(value_diffs_max)) * 100
+        diff_episodes = np.arange(0, len(value_diffs_max)) * 300
         plot_and_save(diff_episodes, value_diffs_max,
                      "Max Value Difference Between Steps", "Episode", "Max |ΔV|",
                      os.path.join(outdir, "value_diff_max.png"))
@@ -266,9 +274,9 @@ def plot_training_progress(pursuer_rewards: list, evader_rewards: list,
                      "Mean Value Difference Between Steps", "Episode", "Mean |ΔV|",
                      os.path.join(outdir, "value_diff_mean.png"))
     
-    # Policy L1 differences
+    # Policy L1 differences (tracked every 300 episodes)
     if policy_l1_diffs:
-        diff_episodes = np.arange(0, len(policy_l1_diffs)) * 100
+        diff_episodes = np.arange(0, len(policy_l1_diffs)) * 300
         plot_and_save(diff_episodes, policy_l1_diffs,
                      "Mean L1 Norm of Policy Differences", "Episode", "Mean L1(π)",
                      os.path.join(outdir, "policy_l1_diff.png"))
@@ -564,37 +572,130 @@ def evaluate_all_starts(env: CompetitiveEnv, agent: NashDQN,
     print(f"  Reward distribution plot saved to: {os.path.join(outdir, 'reward_distribution.png')}")
 
 
+def save_parameters(params: Dict, outdir: str):
+    """Save all parameters to a JSON file."""
+    params_file = os.path.join(outdir, 'parameters.json')
+    # Add timestamp
+    import datetime
+    params['run_info'] = {
+        'timestamp': datetime.datetime.now().isoformat(),
+        'timestamp_readable': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
+    with open(params_file, 'w') as f:
+        json.dump(params, f, indent=2)
+    print(f"Parameters saved to {params_file}")
+
+
 def main():
     """Main training and evaluation loop."""
     # Set random seed for reproducibility
-    np.random.seed(42)
+    random_seed = 42
+    np.random.seed(random_seed)
     import torch
-    torch.manual_seed(42)
+    torch.manual_seed(random_seed)
     
     outdir = 'nash_results'
     os.makedirs(outdir, exist_ok=True)
     
+    # Environment parameters
+    env_size = 4
+    
+    # Agent hyperparameters
+    input_size = 4  # [pursuer_x, pursuer_y, evader_x, evader_y]
+    joint_action_size = 16  # 4 × 4 joint actions
+    hidden_size = 128
+    learning_rate = 5e-4
+    gamma = 0.95
+    epsilon_start = 0.5
+    epsilon_end = 0.01
+    epsilon_decay = 0.995
+    tau = 0.01
+    batch_size = 256  # Increased for better GPU utilization
+    buffer_size = 50000
+    
+    # Training parameters
+    num_episodes = 30000
+    max_steps = 50
+    
     # Create environment
-    env = CompetitiveEnv(size=4)
+    env = CompetitiveEnv(size=env_size)
     
     # Create Nash DQN agent
     agent = NashDQN(
-        input_size=4,  # [pursuer_x, pursuer_y, evader_x, evader_y]
-        joint_action_size=16,  # 4 × 4 joint actions
-        learning_rate=5e-4,
-        gamma=0.95,
-        epsilon_start=0.5,
-        epsilon_end=0.01,
-        epsilon_decay=0.995,
-        tau=0.01,
-        batch_size=64,
-        buffer_size=50000
+        input_size=input_size,
+        joint_action_size=joint_action_size,
+        learning_rate=learning_rate,
+        gamma=gamma,
+        epsilon_start=epsilon_start,
+        epsilon_end=epsilon_end,
+        epsilon_decay=epsilon_decay,
+        tau=tau,
+        batch_size=batch_size,
+        buffer_size=buffer_size
     )
+    
+    # Get device information
+    import torch
+    device_info = {
+        'device': str(agent.device),
+        'cuda_available': torch.cuda.is_available(),
+    }
+    if torch.cuda.is_available():
+        device_info['cuda_device'] = torch.cuda.get_device_name(0)
+        device_info['cuda_version'] = torch.version.cuda
+        device_info['gpu_count'] = torch.cuda.device_count()
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    else:
+        print("WARNING: CUDA not available, using CPU (will be very slow)")
+    
+    # Collect all parameters
+    parameters = {
+        'random_seed': random_seed,
+        'environment': {
+            'size': env_size,
+        },
+        'agent': {
+            'input_size': input_size,
+            'joint_action_size': joint_action_size,
+            'hidden_size': hidden_size,
+            'learning_rate': learning_rate,
+            'gamma': gamma,
+            'epsilon_start': epsilon_start,
+            'epsilon_end': epsilon_end,
+            'epsilon_decay': epsilon_decay,
+            'tau': tau,
+            'batch_size': batch_size,
+            'buffer_size': buffer_size,
+        },
+        'training': {
+            'num_episodes': num_episodes,
+            'max_steps': max_steps,
+        },
+        'network_architecture': {
+            'type': 'NashDQNNetwork',
+            'layers': [
+                {'type': 'Linear', 'input': input_size, 'output': hidden_size},
+                {'type': 'ReLU'},
+                {'type': 'Linear', 'input': hidden_size, 'output': hidden_size},
+                {'type': 'ReLU'},
+                {'type': 'Linear', 'input': hidden_size, 'output': joint_action_size},
+            ]
+        },
+        'nash_equilibrium': {
+            'method': 'linear_programming',
+            'solver': 'scipy.optimize.linprog',
+        },
+        'device': device_info
+    }
+    
+    # Save parameters
+    save_parameters(parameters, outdir)
     
     # Train agent
     (pursuer_rewards, evader_rewards, episode_lengths, td_errors,
      episode_winners, policy_entropies, value_diffs_max, value_diffs_mean,
-     policy_l1_diffs) = train_agent(env, agent, num_episodes=30000, max_steps=50)
+     policy_l1_diffs) = train_agent(env, agent, num_episodes=num_episodes, max_steps=max_steps)
     
     # Plot training progress
     plot_training_progress(pursuer_rewards, evader_rewards, episode_lengths, td_errors,

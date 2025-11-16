@@ -165,8 +165,12 @@ class NashDQN:
         # Track TD errors per episode
         self.episode_td_errors = []
         
-        # Cache for Nash policies and values
-        self._nash_cache = {}
+        # Cache for Nash policies and values (with size limit)
+        # Separate caches for Q-network and target network
+        self._nash_cache_q = {}  # Cache for main Q-network
+        self._nash_cache_max_size = 5000  # Limit cache size to prevent memory issues
+
+
     
     def _q_values_to_matrix(self, q_values: np.ndarray) -> np.ndarray:
         """Convert Q-values (16) to payoff matrix (4x4) for pursuer."""
@@ -180,12 +184,14 @@ class NashDQN:
         return M
     
     def _solve_nash_for_state(self, state: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
-        """Solve Nash equilibrium for a given state. Returns (pursuer_policy, evader_policy, value)."""
+        """Solve Nash equilibrium for a given state using Q-network. Returns (pursuer_policy, evader_policy, value)."""
         state_key = tuple(state)
-        if state_key in self._nash_cache:
-            return self._nash_cache[state_key]
         
-        # Get Q-values
+        # Check cache (but be aware it may be stale during training)
+        if state_key in self._nash_cache_q:
+            return self._nash_cache_q[state_key]
+        
+        # Get Q-values from Q-network
         q_values = self.get_q_values(state)
         
         # Convert to payoff matrix
@@ -194,8 +200,13 @@ class NashDQN:
         # Solve Nash equilibrium
         pursuer_policy, evader_policy, value = solve_nash_equilibrium(M)
         
-        # Cache result
-        self._nash_cache[state_key] = (pursuer_policy, evader_policy, value)
+        # Cache result (with size limit)
+        if len(self._nash_cache_q) >= self._nash_cache_max_size:
+            # Remove oldest entries (simple FIFO by clearing half)
+            keys_to_remove = list(self._nash_cache_q.keys())[:self._nash_cache_max_size // 2]
+            for key in keys_to_remove:
+                del self._nash_cache_q[key]
+        self._nash_cache_q[state_key] = (pursuer_policy, evader_policy, value)
         return pursuer_policy, evader_policy, value
     
     def choose_joint_action(self, state: np.ndarray, training: bool = True) -> Tuple[int, int]:
@@ -235,12 +246,12 @@ class NashDQN:
         # Sample batch
         batch = self.replay_buffer.sample(self.batch_size)
         
-        # Convert to tensors
-        states = torch.FloatTensor([e[0] for e in batch]).to(self.device)
-        actions = torch.LongTensor([e[1] for e in batch]).to(self.device)
-        rewards = torch.FloatTensor([e[2] for e in batch]).to(self.device)
-        next_states = torch.FloatTensor([e[3] for e in batch]).to(self.device)
-        dones = torch.BoolTensor([e[4] for e in batch]).to(self.device)
+        # Convert to tensors efficiently - use torch.from_numpy to avoid unnecessary copies
+        states = torch.from_numpy(np.array([e[0] for e in batch], dtype=np.float32)).to(self.device)
+        actions = torch.from_numpy(np.array([e[1] for e in batch], dtype=np.int64)).to(self.device)
+        rewards = torch.from_numpy(np.array([e[2] for e in batch], dtype=np.float32)).to(self.device)
+        next_states = torch.from_numpy(np.array([e[3] for e in batch], dtype=np.float32)).to(self.device)
+        dones = torch.from_numpy(np.array([e[4] for e in batch], dtype=bool)).to(self.device)
         
         # Current Q values
         current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
@@ -266,6 +277,10 @@ class NashDQN:
         loss.backward()
         self.optimizer.step()
         
+        # optimizer.step() updates ALL Q-network weights, making all cached Nash solutions stale
+        # Clear Q-network cache immediately after weight update
+        self._nash_cache_q.clear()
+        
         # Track TD error
         td_error = (target_q_values - current_q_values.squeeze()).abs().mean().item()
         self.episode_td_errors.append(td_error)
@@ -283,9 +298,7 @@ class NashDQN:
     def start_episode(self):
         """Called at the start of each episode."""
         self.episode_td_errors = []
-        # Clear cache periodically to avoid stale solutions
-        if len(self._nash_cache) > 1000:
-            self._nash_cache.clear()
+        # Cache invalidation is handled in train_step based on training steps
     
     def end_episode(self) -> float:
         """Called at the end of each episode. Returns average TD error."""
@@ -303,7 +316,11 @@ class NashDQN:
     def get_q_values(self, state: np.ndarray) -> np.ndarray:
         """Get Q-values for all joint actions."""
         with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            # Use torch.from_numpy for better performance (avoids copy)
+            if isinstance(state, np.ndarray):
+                state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+            else:
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             q_values = self.q_network(state_tensor)
             return q_values.cpu().numpy().flatten()
     
@@ -311,7 +328,11 @@ class NashDQN:
         """Solve Nash equilibrium using target network."""
         # Get Q-values from target network
         with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            # Use torch.from_numpy for better performance (avoids copy)
+            if isinstance(state, np.ndarray):
+                state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+            else:
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             q_values = self.target_network(state_tensor).cpu().numpy().flatten()
         
         # Convert to payoff matrix
@@ -369,5 +390,5 @@ class NashDQN:
     
     def clear_cache(self):
         """Clear the Nash equilibrium cache."""
-        self._nash_cache.clear()
+        self._nash_cache_q.clear()
 
