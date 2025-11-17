@@ -304,47 +304,72 @@ def test_torch_batch_solver():
         'max_value_diff': 0,
     }
     
-    for i, test_case in enumerate(test_cases, 1):
+    # Pre-compute LP results and build batch q-values
+    lp_results = []
+    q_values_list = []
+    tolerance = 0.02
+    
+    for test_case in test_cases:
         M = test_case['M']
-        name = test_case['name']
         
-        print(f"Test {i}/{len(test_cases)}: {name}")
-        print(f"  Matrix:\n{M}\n")
-        
-        # Solve with LP (exact)
+        # Solve with LP (exact) per test case
         start_time = time.perf_counter()
         x_lp, y_lp, v_lp = solve_nash_equilibrium(M.copy(), use_fast_approx=False)
         lp_time = time.perf_counter() - start_time
         results_summary['lp_times'].append(lp_time)
         
+        lp_results.append({
+            'x': x_lp,
+            'y': y_lp,
+            'v': v_lp,
+            'time': lp_time,
+        })
+        
         # Convert M to Q-values format (16 values)
-        # Q-values are indexed as: pursuer_action * 4 + evader_action
-        q_values = np.zeros(16)
+        q_values = np.zeros(16, dtype=np.float32)
         for pursuer_action in range(4):
             for evader_action in range(4):
                 joint_idx = pursuer_action * 4 + evader_action
                 q_values[joint_idx] = M[pursuer_action, evader_action]
+        q_values_list.append(q_values)
+    
+    # Run the torch solver once on the full batch
+    q_values_batch = torch.from_numpy(np.stack(q_values_list, axis=0)).to(device)
+    start_time = time.perf_counter()
+    x_torch_batch, y_torch_batch, v_torch_batch = solve_nash_equilibrium_fast_4x4_torch_batch(q_values_batch)
+    torch_total_time = time.perf_counter() - start_time
+    per_case_torch_time = torch_total_time / len(test_cases)
+    
+    x_torch_np = x_torch_batch.detach().cpu().numpy()
+    y_torch_np = y_torch_batch.detach().cpu().numpy()
+    v_torch_np = v_torch_batch.detach().cpu().numpy()
+    
+    print(f"Torch batch total time: {torch_total_time*1000:.3f} ms (~{per_case_torch_time*1000:.3f} ms per case)\n")
+    
+    for i, test_case in enumerate(test_cases, 1):
+        M = test_case['M']
+        name = test_case['name']
+        x_lp = lp_results[i-1]['x']
+        y_lp = lp_results[i-1]['y']
+        v_lp = lp_results[i-1]['v']
+        lp_time = lp_results[i-1]['time']
         
-        # Convert to batch tensor (batch_size=1 for single test)
-        q_values_batch = torch.from_numpy(q_values).float().unsqueeze(0).to(device)
+        torch_time = per_case_torch_time
+        x_torch_case = x_torch_np[i-1]
+        y_torch_case = y_torch_np[i-1]
+        v_torch_case = float(v_torch_np[i-1])
         
-        # Solve with torch batch solver
-        start_time = time.perf_counter()
-        x_torch, y_torch, v_torch = solve_nash_equilibrium_fast_4x4_torch_batch(q_values_batch)
-        torch_time = time.perf_counter() - start_time
+        print(f"Test {i}/{len(test_cases)}: {name}")
+        print(f"  Matrix:\n{M}\n")
+        
         results_summary['torch_times'].append(torch_time)
-        
         if lp_time > 0:
-            speedup = lp_time / torch_time
+            speedup = lp_time / torch_time if torch_time > 0 else float('inf')
             results_summary['speedup'].append(speedup)
+        else:
+            speedup = float('inf')
         
-        # Convert back to numpy
-        x_torch_np = x_torch.cpu().numpy()[0]
-        y_torch_np = y_torch.cpu().numpy()[0]
-        v_torch_np = float(v_torch.cpu().numpy()[0])
-        tolerance=.02
-        # Compare solutions
-        comparison = compare_solutions(x_lp, y_lp, v_lp, x_torch_np, y_torch_np, v_torch_np, M,tolerance)
+        comparison = compare_solutions(x_lp, y_lp, v_lp, x_torch_case, y_torch_case, v_torch_case, M, tolerance)
         
         print(f"  LP Solution:")
         print(f"    Pursuer policy: {x_lp}")
@@ -353,10 +378,10 @@ def test_torch_batch_solver():
         print(f"    Time: {lp_time*1000:.3f} ms")
         
         print(f"  Torch Batch Solution:")
-        print(f"    Pursuer policy: {x_torch_np}")
-        print(f"    Evader policy: {y_torch_np}")
-        print(f"    Value: {v_torch_np:.6f}")
-        print(f"    Time: {torch_time*1000:.3f} ms")
+        print(f"    Pursuer policy: {x_torch_case}")
+        print(f"    Evader policy: {y_torch_case}")
+        print(f"    Value: {v_torch_case:.6f}")
+        print(f"    Time (avg per case): {torch_time*1000:.3f} ms")
         
         if lp_time > 0:
             print(f"  Speedup: {speedup:.2f}x")
@@ -384,9 +409,8 @@ def test_torch_batch_solver():
         else:
             print(f"  ✗ Outside tolerance (target: < {tolerance})")
         
-        # Update max differences
         results_summary['max_pursuer_diff'] = max(
-            results_summary['max_pursuer_diff'], 
+            results_summary['max_pursuer_diff'],
             comparison['pursuer_policy_diff']
         )
         results_summary['max_evader_diff'] = max(
