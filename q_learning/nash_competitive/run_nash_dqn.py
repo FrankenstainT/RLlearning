@@ -686,7 +686,7 @@ def main():
     buffer_size = 50000
     
     # Training parameters
-    num_episodes = 30000
+    num_episodes = 20000
     max_steps = 50
     
     # Create environment
@@ -709,7 +709,7 @@ def main():
         tau=tau,
         batch_size=batch_size,
         buffer_size=buffer_size,
-        use_fast_nash=False, # Use fast approximate Nash solver
+        use_fast_nash=True, # Use fast approximate Nash solver
         update_cache_after_training=update_cache,
         cache_update_frequency=cache_update_frequency
     )

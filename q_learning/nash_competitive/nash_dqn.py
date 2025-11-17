@@ -400,7 +400,7 @@ def solve_nash_equilibrium_fast_4x4(M: np.ndarray):
     return best_x, best_y, best_v
 
 
-def solve_nash_equilibrium_lp_torch_batch(q_values_batch) -> Tuple:
+def solve_nash_equilibrium_lp_torch_batch(q_values_batch, use_fast_nash=True) -> Tuple:
     """
     Exact Nash equilibrium solver that processes each game sequentially on CPU.
     This avoids GPU/CVXPY overhead and always calls the reference LP solver.
@@ -424,7 +424,7 @@ def solve_nash_equilibrium_lp_torch_batch(q_values_batch) -> Tuple:
     for q_values in q_values_np:
         q_flat = np.array(q_values, dtype=np.float64).reshape(-1)
         M = _q_values_to_matrix_static(q_flat)
-        x, y, v = solve_nash_equilibrium(M, use_fast_approx=False)
+        x, y, v = solve_nash_equilibrium(M, use_fast_approx=use_fast_nash)
         pursuer_policies.append(x)
         evader_policies.append(y)
         values.append(v)
@@ -435,7 +435,7 @@ def solve_nash_equilibrium_lp_torch_batch(q_values_batch) -> Tuple:
     return x_tensor, y_tensor, v_tensor
 
 
-def solve_nash_equilibrium_fast_4x4_torch_batch(q_values_batch) -> Tuple:
+def solve_nash_equilibrium_fast_4x4_torch_batch(q_values_batch, use_fast_nash=True) -> Tuple:
     """
     Exact Nash equilibrium solver using linear programming in PyTorch (GPU batch).
     This is now an alias for the LP solver.
@@ -448,7 +448,7 @@ def solve_nash_equilibrium_fast_4x4_torch_batch(q_values_batch) -> Tuple:
         evader_policies: Tensor of shape [batch_size, 4]
         values: Tensor of shape [batch_size]
     """
-    return solve_nash_equilibrium_lp_torch_batch(q_values_batch)
+    return solve_nash_equilibrium_lp_torch_batch(q_values_batch, use_fast_nash=use_fast_nash)
 
 
 def _solve_nash_for_q_values_helper(q_values: np.ndarray, use_fast_nash: bool) -> Tuple[np.ndarray, np.ndarray, float]:
@@ -723,7 +723,7 @@ class NashDQN:
             # Compute Nash values in batch on GPU
             if self.use_fast_nash:
                 # Use fast GPU batch solver
-                _, _, next_nash_values = solve_nash_equilibrium_fast_4x4_torch_batch(next_q_values)
+                _, _, next_nash_values = solve_nash_equilibrium_fast_4x4_torch_batch(next_q_values, use_fast_nash=self.use_fast_nash)
             else:
                 # Fallback: compute individually (slower)
                 next_nash_values = []
