@@ -13,6 +13,7 @@ import sys
 import os
 from typing import Tuple, Dict, List
 from functools import partial
+from contextlib import contextmanager
 
 # Lazy import scipy (only when solving LP)
 _linprog = None
@@ -966,10 +967,28 @@ class NashDQN:
             'values': values
         }
     
-    def clear_cache(self):
-        """Clear the Nash equilibrium cache."""
+    def reset_nash_caches(self):
+        """Reset cached Nash solutions."""
         self._nash_cache_q.clear()
         self._nash_cache_target.clear()
+        self._target_cache_updates_since_clear = 0
+    
+    def set_fast_nash_mode(self, enabled: bool):
+        """Enable or disable fast Nash approximation and reset caches if changed."""
+        enabled = bool(enabled)
+        if self.use_fast_nash != enabled:
+            self.use_fast_nash = enabled
+            self.reset_nash_caches()
+    
+    @contextmanager
+    def exact_nash_mode(self):
+        """Context manager to temporarily force exact LP solves."""
+        previous = self.use_fast_nash
+        self.set_fast_nash_mode(False)
+        try:
+            yield
+        finally:
+            self.set_fast_nash_mode(previous)
     
     def cleanup(self):
         """Clean up resources (close worker pool)."""

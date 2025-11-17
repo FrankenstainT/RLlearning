@@ -71,7 +71,7 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
     
     prev_snapshot = None
     if print_interval is None:
-        print_interval = max(1, log_interval) if log_interval else 500
+        print_interval = max(1, log_interval) if log_interval else 100
     
     print(f"Training for {num_episodes} episodes...")
     start_time = time.time()
@@ -191,9 +191,9 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
             seconds = int(elapsed_time % 60)
             time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
             print(f"Episode {episode + 1}/{num_episodes} - "
-                  f"Pursuer Avg Reward (last 100): {np.mean(pursuer_rewards[-100:]):.2f}, "
-                  f"Evader Avg Reward (last 100): {np.mean(evader_rewards[-100:]):.2f}, "
-                  f"Avg Steps: {np.mean(episode_lengths[-100:]):.2f}, "
+                  f"Pursuer Avg Reward (last 100): {np.mean(pursuer_rewards[-print_interval:]):.2f}, "
+                  f"Evader Avg Reward (last 100): {np.mean(evader_rewards[-print_interval:]):.2f}, "
+                  f"Avg Steps: {np.mean(episode_lengths[-print_interval:]):.2f}, "
                   f"Pursuer Win Rate (last {print_interval}): {pursuer_wins/print_interval:.2%}, "
                   f"Epsilon: {agent.epsilon:.4f}, "
                   f"Time: {time_str}")
@@ -216,34 +216,35 @@ def plot_training_progress(pursuer_rewards: list, evader_rewards: list,
     plot_and_save(episodes, pursuer_rewards,
                  "Pursuer Episode Rewards", "Episode", "Reward",
                  os.path.join(outdir, "pursuer_rewards.png"))
-    if len(pursuer_rewards) >= 100:
-        ma_pursuer = moving_average(np.array(pursuer_rewards), 100)
-        ma_episodes = np.arange(100, len(pursuer_rewards) + 1)
+    window = 20
+    if len(pursuer_rewards) >= window:
+        ma_pursuer = moving_average(np.array(pursuer_rewards), window)
+        ma_episodes = np.arange(window, len(pursuer_rewards) + 1)
         plot_and_save(ma_episodes, ma_pursuer,
-                     "Pursuer Episode Rewards (MA=100)", "Episode", "Reward",
-                     os.path.join(outdir, "pursuer_rewards_ma100.png"))
+                     f"Pursuer Episode Rewards (MA={window})", "Episode", "Reward",
+                     os.path.join(outdir, f"pursuer_rewards_ma{window}.png"))
     
     # Episode rewards - Evader
     plot_and_save(episodes, evader_rewards,
                  "Evader Episode Rewards", "Episode", "Reward",
                  os.path.join(outdir, "evader_rewards.png"))
-    if len(evader_rewards) >= 100:
-        ma_evader = moving_average(np.array(evader_rewards), 100)
-        ma_episodes = np.arange(100, len(evader_rewards) + 1)
+    if len(evader_rewards) >= window:
+        ma_evader = moving_average(np.array(evader_rewards), window)
+        ma_episodes = np.arange(window, len(evader_rewards) + 1)
         plot_and_save(ma_episodes, ma_evader,
-                     "Evader Episode Rewards (MA=100)", "Episode", "Reward",
-                     os.path.join(outdir, "evader_rewards_ma100.png"))
+                     f"Evader Episode Rewards (MA={window})", "Episode", "Reward",
+                     os.path.join(outdir, f"evader_rewards_ma{window}.png"))
     
     # TD Errors
     plot_and_save(episodes, td_errors,
                  "TD Error Per Episode", "Episode", "TD Error",
                  os.path.join(outdir, "td_error_per_episode.png"))
-    if len(td_errors) >= 100:
-        ma_td = moving_average(np.array(td_errors), 100)
-        ma_episodes = np.arange(100, len(td_errors) + 1)
+    if len(td_errors) >= window:
+        ma_td = moving_average(np.array(td_errors), window)
+        ma_episodes = np.arange(window, len(td_errors) + 1)
         plot_and_save(ma_episodes, ma_td,
-                     "TD Error Per Episode (MA=100)", "Episode", "TD Error",
-                     os.path.join(outdir, "td_error_ma100.png"))
+                     f"TD Error Per Episode (MA={window})", "Episode", "TD Error",
+                     os.path.join(outdir, f"td_error_ma{window}.png"))
     
     # Steps per episode
     plot_and_save(episodes, episode_lengths,
@@ -251,7 +252,7 @@ def plot_training_progress(pursuer_rewards: list, evader_rewards: list,
                  os.path.join(outdir, "episode_lengths.png"))
     
     # Win rate
-    window = 1000
+    
     pursuer_wins = np.array([1 if w == "Pursuer" else 0 for w in episode_winners], float)
     if len(pursuer_wins) >= window:
         ma_wins = moving_average(pursuer_wins, window)
@@ -695,7 +696,7 @@ def main():
     buffer_size = 50000
     
     # Training parameters
-    num_episodes = 10000
+    num_episodes = 3000
     max_steps = 50
     
     # Create environment
@@ -811,7 +812,7 @@ def main():
         max_steps=max_steps,
         log_interval=500,  # Disable expensive drift tracking
         track_policy_drift=True,
-        print_interval=500
+        print_interval=20
     )
     
     # Plot training progress
@@ -819,11 +820,10 @@ def main():
                           episode_winners, policy_entropies, value_diffs_max, 
                           value_diffs_mean, policy_l1_diffs, outdir=outdir)
     
-    # Visualize learned policies
-    visualize_policies(env, agent, outdir=outdir)
-    
-    # Evaluate from all start position pairs
-    evaluate_all_starts(env, agent, max_steps=50, outdir=outdir)
+    # Visualize and evaluate using exact LP solver
+    with agent.exact_nash_mode():
+        visualize_policies(env, agent, outdir=outdir)
+        evaluate_all_starts(env, agent, max_steps=50, outdir=outdir)
     
     # Cleanup resources
     agent.cleanup()
