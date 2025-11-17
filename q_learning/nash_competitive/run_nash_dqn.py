@@ -11,7 +11,7 @@ import time
 # Add parent directory to path to import shared modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from competitive_env import CompetitiveEnv
-from nash_dqn import NashDQN
+from nash_dqn import NashDQN, HAS_MULTIPROCESSING, IS_WINDOWS, CUDA_AVAILABLE
 from visualization import frames_to_gif
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -586,6 +586,74 @@ def save_parameters(params: Dict, outdir: str):
     print(f"Parameters saved to {params_file}")
 
 
+def print_parallelization_status(agent, env):
+    """Print parallelization and optimization features status."""
+    import torch
+    
+    print("\n" + "=" * 80)
+    print("Parallelization and Optimization Status")
+    print("=" * 80)
+    
+    # 1. Batch GPU computation for all Q-values
+    gpu_available = torch.cuda.is_available()
+    batch_gpu = gpu_available
+    print(f"1. Batch GPU computation for all Q-values: {'✓ ENABLED' if batch_gpu else '✗ DISABLED (CPU only)'}")
+    if batch_gpu:
+        print(f"   Device: {torch.cuda.get_device_name(0)}")
+    
+    # 2. Multiprocessing for batch linear programming
+    multiprocessing_enabled = (HAS_MULTIPROCESSING and 
+                              agent.num_workers > 1 and 
+                              hasattr(env, 'valid_positions'))
+    if multiprocessing_enabled:
+        # Check if we have enough states to benefit
+        all_states_count = len([(p, e) for p in env.valid_positions 
+                                for e in env.valid_positions if p != e])
+        multiprocessing_enabled = all_states_count > 10
+    
+    print(f"2. Multiprocessing for batch linear programming: {'✓ ENABLED' if multiprocessing_enabled else '✗ DISABLED'}")
+    if multiprocessing_enabled:
+        print(f"   Workers: {agent.num_workers}")
+        if CUDA_AVAILABLE and not IS_WINDOWS:
+            print(f"   Start method: spawn (required for CUDA)")
+        elif IS_WINDOWS:
+            print(f"   Start method: spawn (Windows default)")
+        else:
+            print(f"   Start method: fork (Linux default)")
+    else:
+        reasons = []
+        if not HAS_MULTIPROCESSING:
+            reasons.append("multiprocessing not available")
+        if agent.num_workers <= 1:
+            reasons.append(f"num_workers={agent.num_workers}")
+        if CUDA_AVAILABLE and IS_WINDOWS:
+            reasons.append("Windows with CUDA (spawn overhead)")
+        print(f"   Reason: {', '.join(reasons) if reasons else 'small batch size'}")
+    
+    # 3. Pre-solve all linear programming after update
+    cache_update = agent.update_cache_after_training
+    print(f"3. Pre-solve all linear programming after update: {'✓ ENABLED' if cache_update else '✗ DISABLED'}")
+    if cache_update:
+        if hasattr(agent, '_all_states_for_cache') and agent._all_states_for_cache:
+            num_states = len(agent._all_states_for_cache)
+            print(f"   States to cache: {num_states}")
+            print(f"   Cache will be updated after each training step")
+        else:
+            print(f"   WARNING: All states not set for cache (call agent.set_all_states_for_cache())")
+    else:
+        print(f"   Nash equilibria will be solved on-demand during action selection")
+    
+    # 4. Fast Nash algorithm
+    fast_nash = agent.use_fast_nash
+    print(f"4. Fast Nash algorithm: {'✓ ENABLED' if fast_nash else '✗ DISABLED (using exact LP)'}")
+    if fast_nash:
+        print(f"   Using iterative best response (approximate, ~10-100x faster)")
+    else:
+        print(f"   Using exact linear programming solver")
+    
+    print("=" * 80 + "\n")
+
+
 def main():
     """Main training and evaluation loop."""
     # Set random seed for reproducibility
@@ -706,6 +774,9 @@ def main():
     
     # Save parameters
     save_parameters(parameters, outdir)
+    
+    # Print parallelization status
+    print_parallelization_status(agent, env)
     
     # Train agent
     (pursuer_rewards, evader_rewards, episode_lengths, td_errors,
