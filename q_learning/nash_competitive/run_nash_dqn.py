@@ -694,7 +694,7 @@ def main():
     
     # Create Nash DQN agent
     # Optionally enable cache updates periodically for faster action selection
-    update_cache = True  # Set to True to pre-compute Nash for all states periodically
+    update_cache = False  # Set to True to pre-compute Nash for all states periodically
     # Since train_step is already batched (256 samples), we can update cache more frequently
     # cache_update_frequency=1 means every training step (which processes 256 samples)
     cache_update_frequency = 1  # Update cache every N training steps (1 = every step, which is batched)

@@ -796,6 +796,7 @@ class NashDQN:
     
     def get_q_values(self, state: np.ndarray) -> np.ndarray:
         """Get Q-values for all joint actions."""
+        torch = _import_torch()
         with torch.no_grad():
             # Use torch.from_numpy for better performance (avoids copy)
             if isinstance(state, np.ndarray):
@@ -807,6 +808,7 @@ class NashDQN:
     
     def _solve_nash_for_state_target(self, state: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """Solve Nash equilibrium using target network."""
+        torch = _import_torch()
         state_key = tuple(state)
         if state_key in self._nash_cache_target:
             return self._nash_cache_target[state_key]
