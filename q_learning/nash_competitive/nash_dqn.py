@@ -21,19 +21,33 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dqn_learning import ReplayBuffer
 
 # Try to import parallel processing
-# Note: Multiprocessing on Windows with PyTorch causes memory issues
-# We'll use sequential processing but still benefit from batch GPU computation
+# Note: With CUDA, we must use 'spawn' start method instead of 'fork'
+# We ensure only numpy arrays are passed to workers (no CUDA tensors)
 import platform
 IS_WINDOWS = platform.system() == 'Windows'
 
+# Check if CUDA is available
 try:
-    if not IS_WINDOWS:
-        from multiprocessing import Pool, cpu_count
-        HAS_MULTIPROCESSING = True
-    else:
-        # Disable multiprocessing on Windows to avoid memory issues
-        HAS_MULTIPROCESSING = False
-        from multiprocessing import cpu_count
+    import torch
+    CUDA_AVAILABLE = torch.cuda.is_available()
+except:
+    CUDA_AVAILABLE = False
+
+try:
+    from multiprocessing import Pool, cpu_count, set_start_method, get_start_method
+    HAS_MULTIPROCESSING = True
+    
+    # Set start method for multiprocessing
+    # 'spawn' works with CUDA, 'fork' does not
+    if CUDA_AVAILABLE and not IS_WINDOWS:
+        # On Linux with CUDA, use 'spawn' instead of default 'fork'
+        try:
+            current_method = get_start_method(allow_none=True)
+            if current_method != 'spawn':
+                set_start_method('spawn', force=True)
+        except RuntimeError:
+            # Start method already set, that's fine
+            pass
 except ImportError:
     HAS_MULTIPROCESSING = False
     cpu_count = lambda: 1
@@ -499,9 +513,9 @@ class NashDQN:
         q_values_batch = self._batch_compute_q_values(all_states)
         
         # Solve Nash equilibria
-        # Note: On Windows, multiprocessing causes memory issues with PyTorch
+        # Note: Multiprocessing is disabled when CUDA is available or on Windows
         # We use sequential processing but still benefit from batch GPU computation above
-        if HAS_MULTIPROCESSING and not IS_WINDOWS and self.num_workers > 1 and len(all_states) > 10:
+        if HAS_MULTIPROCESSING and self.num_workers > 1 and len(all_states) > 10:
             # Parallel processing (use module-level function) - only on non-Windows
             solve_func = partial(_solve_nash_for_q_values_helper, use_fast_nash=self.use_fast_nash)
             with Pool(processes=self.num_workers) as pool:
@@ -530,11 +544,12 @@ class NashDQN:
         # Batch compute all Q-values on GPU (much faster than one-by-one)
         q_values_batch = self._batch_compute_q_values(all_states)
         
-        # Solve Nash equilibria in parallel
+        # Solve Nash equilibria
         if HAS_MULTIPROCESSING and self.num_workers > 1 and len(all_states) > 10:
-            # Parallel processing
+            # Parallel processing (use module-level function for pickling)
+            solve_func = partial(_solve_nash_for_q_values_helper, use_fast_nash=self.use_fast_nash)
             with Pool(processes=self.num_workers) as pool:
-                results = pool.map(self._solve_nash_for_q_values, q_values_batch)
+                results = pool.map(solve_func, q_values_batch)
         else:
             # Sequential processing (fallback)
             results = [self._solve_nash_for_q_values(qv) for qv in q_values_batch]
