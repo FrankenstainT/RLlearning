@@ -575,7 +575,8 @@ class NashDQN:
                  use_fast_nash: bool = True,
                  update_cache_after_training: bool = False,
                  cache_update_frequency: int = 1,
-                 num_workers: int = None):
+                 num_workers: int = None,
+                 enable_multiprocessing: bool | None = None):
         self.joint_action_size = joint_action_size
         self.gamma = gamma
         self.epsilon_start = epsilon_start
@@ -588,6 +589,11 @@ class NashDQN:
         self.update_cache_after_training = update_cache_after_training  # Update cache after each training step
         self.cache_update_frequency = cache_update_frequency  # Update cache every N training steps
         self.num_workers = num_workers if num_workers is not None else (get_cpu_count() if get_has_multiprocessing() else 1)
+        if self.num_workers < 1:
+            self.num_workers = 1
+        if enable_multiprocessing is None:
+            enable_multiprocessing = get_has_multiprocessing()
+        self.enable_multiprocessing = bool(enable_multiprocessing and get_has_multiprocessing() and self.num_workers > 1)
         
         # Torch optimizer
         optim = torch.optim
@@ -721,20 +727,20 @@ class NashDQN:
             next_q_values = self.target_network(next_states)  # [batch_size, 16]
             
             # Compute Nash values in batch on GPU
-            if self.use_fast_nash:
-                # Use fast GPU batch solver
-                _, _, next_nash_values = solve_nash_equilibrium_fast_4x4_torch_batch(next_q_values, use_fast_nash=self.use_fast_nash)
-            else:
+            # if self.use_fast_nash:
+            #     # Use fast GPU batch solver
+            #     _, _, next_nash_values = solve_nash_equilibrium_fast_4x4_torch_batch(next_q_values, use_fast_nash=self.use_fast_nash)
+            # else:
                 # Fallback: compute individually (slower)
-                next_nash_values = []
-                for i in range(len(next_states)):
-                    if dones[i]:
-                        next_nash_values.append(0.0)
-                    else:
-                        next_state = next_states[i].cpu().numpy()
-                        _, _, nash_value = self._solve_nash_for_state_target(next_state)
-                        next_nash_values.append(nash_value)
-                next_nash_values = torch.FloatTensor(next_nash_values).to(self.device)
+            next_nash_values = []
+            for i in range(len(next_states)):
+                if dones[i]:
+                    next_nash_values.append(0.0)
+                else:
+                    next_state = next_states[i].cpu().numpy()
+                    _, _, nash_value = self._solve_nash_for_state_target(next_state)
+                    next_nash_values.append(nash_value)
+            next_nash_values = torch.FloatTensor(next_nash_values).to(self.device)
             
             # Set to 0 for done states
             next_nash_values = next_nash_values * (~dones).float()
@@ -866,6 +872,8 @@ class NashDQN:
     
     def _get_worker_pool(self):
         """Get or create persistent worker pool for multiprocessing."""
+        if not self.enable_multiprocessing:
+            return None
         if self._worker_pool is None and get_has_multiprocessing() and self.num_workers > 1:
             # Create persistent pool (only once)
             Pool = get_pool()
@@ -891,7 +899,7 @@ class NashDQN:
         q_values_batch = self._batch_compute_q_values(all_states)
         
         # Solve Nash equilibria using persistent worker pool
-        if get_has_multiprocessing() and self.num_workers > 1 and len(all_states) > 10:
+        if self.enable_multiprocessing and self.num_workers > 1 and len(all_states) > 10:
             # Use persistent worker pool (reused, not recreated each time)
             pool = self._get_worker_pool()
             if pool is not None:
@@ -925,7 +933,7 @@ class NashDQN:
         q_values_batch = self._batch_compute_q_values(all_states)
         
         # Solve Nash equilibria using persistent worker pool
-        if get_has_multiprocessing() and self.num_workers > 1 and len(all_states) > 10:
+        if self.enable_multiprocessing and self.num_workers > 1 and len(all_states) > 10:
             # Use persistent worker pool (reused, not recreated each time)
             pool = self._get_worker_pool()
             if pool is not None:

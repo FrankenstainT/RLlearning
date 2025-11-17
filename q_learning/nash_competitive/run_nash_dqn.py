@@ -179,9 +179,9 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
                 policy_l1_diffs.append(0.0)
             
             prev_snapshot = current_snapshot
-        
-        if (episode + 1) % 1000 == 0:
-            pursuer_wins = sum(1 for w in episode_winners[-1000:] if w == "Pursuer")
+        print_interval = 500
+        if (episode + 1) % print_interval == 0:
+            pursuer_wins = sum(1 for w in episode_winners[-print_interval:] if w == "Pursuer")
             elapsed_time = time.time() - start_time
             hours = int(elapsed_time // 3600)
             minutes = int((elapsed_time % 3600) // 60)
@@ -191,7 +191,7 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
                   f"Pursuer Avg Reward (last 100): {np.mean(pursuer_rewards[-100:]):.2f}, "
                   f"Evader Avg Reward (last 100): {np.mean(evader_rewards[-100:]):.2f}, "
                   f"Avg Steps: {np.mean(episode_lengths[-100:]):.2f}, "
-                  f"Pursuer Win Rate (last 1000): {pursuer_wins/1000:.2%}, "
+                  f"Pursuer Win Rate (last {print_interval}): {pursuer_wins/print_interval:.2%}, "
                   f"Epsilon: {agent.epsilon:.4f}, "
                   f"Time: {time_str}")
     
@@ -604,11 +604,13 @@ def print_parallelization_status(agent, env):
     # 2. Multiprocessing for batch linear programming
     has_multiprocessing = get_has_multiprocessing()
     cuda_available = get_cuda_available()
-    multiprocessing_enabled = (has_multiprocessing and 
-                              agent.num_workers > 1 and 
-                              hasattr(env, 'valid_positions'))
+    multiprocessing_enabled = (
+        agent.enable_multiprocessing and
+        has_multiprocessing and 
+        agent.num_workers > 1 and 
+        hasattr(env, 'valid_positions')
+    )
     if multiprocessing_enabled:
-        # Check if we have enough states to benefit
         all_states_count = len([(p, e) for p in env.valid_positions 
                                 for e in env.valid_positions if p != e])
         multiprocessing_enabled = all_states_count > 10
@@ -624,13 +626,17 @@ def print_parallelization_status(agent, env):
             print(f"   Start method: fork (Linux default)")
     else:
         reasons = []
+        if not agent.enable_multiprocessing:
+            reasons.append("manually disabled")
         if not has_multiprocessing:
-            reasons.append("multiprocessing not available")
+            reasons.append("not supported")
         if agent.num_workers <= 1:
             reasons.append(f"num_workers={agent.num_workers}")
         if cuda_available and IS_WINDOWS:
             reasons.append("Windows with CUDA (spawn overhead)")
-        print(f"   Reason: {', '.join(reasons) if reasons else 'small batch size'}")
+        if not reasons:
+            reasons.append("small batch size (< 10 states)")
+        print(f"   Reason: {', '.join(reasons)}")
     
     # 3. Pre-solve all linear programming after update
     cache_update = agent.update_cache_after_training
@@ -698,6 +704,7 @@ def main():
     # Since train_step is already batched (256 samples), we can update cache more frequently
     # cache_update_frequency=1 means every training step (which processes 256 samples)
     cache_update_frequency = 1  # Update cache every N training steps (1 = every step, which is batched)
+    enable_multiprocessing = False  # Set True to allow worker pool usage for snapshots/cache
     agent = NashDQN(
         input_size=input_size,
         joint_action_size=joint_action_size,
@@ -711,7 +718,8 @@ def main():
         buffer_size=buffer_size,
         use_fast_nash=True, # Use fast approximate Nash solver
         update_cache_after_training=update_cache,
-        cache_update_frequency=cache_update_frequency
+        cache_update_frequency=cache_update_frequency,
+        enable_multiprocessing=enable_multiprocessing
     )
     
     # Set all states for cache (if cache updates are enabled)
@@ -758,6 +766,7 @@ def main():
             'tau': tau,
             'batch_size': batch_size,
             'buffer_size': buffer_size,
+            'enable_multiprocessing': enable_multiprocessing,
         },
         'training': {
             'num_episodes': num_episodes,
