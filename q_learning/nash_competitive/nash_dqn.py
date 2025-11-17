@@ -6,17 +6,13 @@ Single Q-network that outputs Q-values for all joint actions (16 values).
 """
 
 import numpy as np
+import torch
 # Lazy imports for heavy modules (only import when needed)
 # This speeds up imports for test files that only need Nash solvers
 import sys
 import os
 from typing import Tuple, Dict, List
 from functools import partial
-
-# Lazy import torch (only when creating networks)
-def _import_torch():
-    import torch
-    return torch
 
 # Lazy import scipy (only when solving LP)
 _linprog = None
@@ -185,7 +181,6 @@ class NashDQNNetwork:
     
     def __init__(self, input_size: int = 4, output_size: int = 16, hidden_size: int = 128):
         # Lazy import torch only when creating network
-        torch = _import_torch()
         nn = torch.nn
         
         # Create a proper nn.Module subclass dynamically
@@ -416,8 +411,6 @@ def solve_nash_equilibrium_lp_torch_batch(q_values_batch) -> Tuple:
     Returns:
         Tuple of tensors (pursuer_policies, evader_policies, values).
     """
-    torch = _import_torch()
-    
     if q_values_batch.dim() == 1:
         q_values_batch = q_values_batch.unsqueeze(0)
     
@@ -596,8 +589,7 @@ class NashDQN:
         self.cache_update_frequency = cache_update_frequency  # Update cache every N training steps
         self.num_workers = num_workers if num_workers is not None else (get_cpu_count() if get_has_multiprocessing() else 1)
         
-        # Lazy import torch and related modules
-        torch = _import_torch()
+        # Torch optimizer
         optim = torch.optim
         
         # Device
@@ -709,8 +701,6 @@ class NashDQN:
         if len(self.replay_buffer) < self.batch_size:
             return
         
-        torch = _import_torch()
-        
         # Sample batch
         batch = self.replay_buffer.sample(self.batch_size)
         
@@ -751,7 +741,7 @@ class NashDQN:
             target_q_values = rewards + (self.gamma * next_nash_values)
         
         # Compute loss
-        loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
+        loss = torch.nn.MSELoss()(current_q_values.squeeze(), target_q_values)
         
         # Optimize
         self.optimizer.zero_grad()
@@ -798,7 +788,6 @@ class NashDQN:
     
     def get_q_values(self, state: np.ndarray) -> np.ndarray:
         """Get Q-values for all joint actions."""
-        torch = _import_torch()
         with torch.no_grad():
             # Use torch.from_numpy for better performance (avoids copy)
             if isinstance(state, np.ndarray):
@@ -810,7 +799,6 @@ class NashDQN:
     
     def _solve_nash_for_state_target(self, state: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """Solve Nash equilibrium using target network."""
-        torch = _import_torch()
         state_key = tuple(state)
         if state_key in self._nash_cache_target:
             return self._nash_cache_target[state_key]
@@ -862,8 +850,6 @@ class NashDQN:
         """Batch compute Q-values for multiple states on GPU."""
         if not states:
             return np.array([])
-        
-        torch = _import_torch()
         
         # Stack all states into a batch tensor
         states_tensor = torch.from_numpy(np.array(states, dtype=np.float32)).to(self.device)
