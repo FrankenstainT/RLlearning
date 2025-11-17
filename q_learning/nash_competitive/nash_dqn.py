@@ -572,13 +572,12 @@ def solve_nash_equilibrium_lp_torch_batch(q_values_batch) -> Tuple:
                     if not solved and 'MPAX' in installed_solvers:
                         try:
                             # MPAX may not need gpu=True parameter, try both
-                            print("Now MPAX")
+
                             try:
                                 problem.solve(solver=cp.MPAX, gpu=True, verbose=False, warm_start=False)
                             except (TypeError, AttributeError):
                                 # If gpu parameter not supported, try without it
                                 problem.solve(solver=cp.MPAX, verbose=False, warm_start=False)
-                            print(f"[MPAX debug] status={problem.status}, solver_stats={problem.solver_stats}")
                             if problem.status == 'optimal' and z.value is not None:
                                 z_sol = z.value
                                 x = z_sol[:m]
@@ -701,14 +700,15 @@ def solve_nash_equilibrium_lp_torch_batch(q_values_batch) -> Tuple:
     if solver_used:
         print(f"[solve_nash_equilibrium_lp_torch_batch] Solver used: {solver_used}")
     # Check for NaN/Inf and replace with uniform if needed
-    has_nan = ~torch.isfinite(x) | ~torch.isfinite(y) | ~torch.isfinite(v)
+    x_nan = ~torch.isfinite(x).all(dim=1)
+    y_nan = ~torch.isfinite(y).all(dim=1)
+    v_nan = ~torch.isfinite(v).view(-1) if v.dim() > 0 else ~torch.isfinite(v)
+    has_nan = x_nan | y_nan | v_nan
     if torch.any(has_nan):
         # Replace NaN with uniform policies
-        nan_mask = has_nan.any(dim=1) if has_nan.dim() > 1 else has_nan
-        if torch.any(nan_mask):
-            x[nan_mask] = 1.0 / m
-            y[nan_mask] = 1.0 / n
-            v[nan_mask] = M[nan_mask].mean(dim=(1, 2))
+        x[has_nan] = 1.0 / m
+        y[has_nan] = 1.0 / n
+        v[has_nan] = M[has_nan].mean(dim=(1, 2))
     
     # Normalize to ensure valid probabilities
     x = torch.clamp(x, min=0.0)
@@ -732,13 +732,14 @@ def solve_nash_equilibrium_lp_torch_batch(q_values_batch) -> Tuple:
     v = v_recomputed
     
     # Final NaN check after recomputation
-    has_nan_final = ~torch.isfinite(x) | ~torch.isfinite(y) | ~torch.isfinite(v)
+    x_nan_final = ~torch.isfinite(x).all(dim=1)
+    y_nan_final = ~torch.isfinite(y).all(dim=1)
+    v_nan_final = ~torch.isfinite(v).view(-1) if v.dim() > 0 else ~torch.isfinite(v)
+    has_nan_final = x_nan_final | y_nan_final | v_nan_final
     if torch.any(has_nan_final):
-        nan_mask_final = has_nan_final.any(dim=1) if has_nan_final.dim() > 1 else has_nan_final
-        if torch.any(nan_mask_final):
-            x[nan_mask_final] = 1.0 / m
-            y[nan_mask_final] = 1.0 / n
-            v[nan_mask_final] = M[nan_mask_final].mean(dim=(1, 2))
+        x[has_nan_final] = 1.0 / m
+        y[has_nan_final] = 1.0 / n
+        v[has_nan_final] = M[has_nan_final].mean(dim=(1, 2))
     
     # Handle constant matrices
     if torch.any(is_constant):
