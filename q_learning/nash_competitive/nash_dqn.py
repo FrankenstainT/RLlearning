@@ -285,6 +285,9 @@ class NashDQN:
         
         # Persistent worker pool for multiprocessing (reuse instead of spawning each time)
         self._worker_pool = None
+        
+        # Track network updates for cache invalidation
+        self._training_steps = 0
 
 
     
