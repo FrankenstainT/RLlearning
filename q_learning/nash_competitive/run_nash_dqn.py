@@ -632,12 +632,14 @@ def print_parallelization_status(agent, env):
     
     # 3. Pre-solve all linear programming after update
     cache_update = agent.update_cache_after_training
+    cache_freq = agent.cache_update_frequency
     print(f"3. Pre-solve all linear programming after update: {'✓ ENABLED' if cache_update else '✗ DISABLED'}")
     if cache_update:
         if hasattr(agent, '_all_states_for_cache') and agent._all_states_for_cache:
             num_states = len(agent._all_states_for_cache)
             print(f"   States to cache: {num_states}")
-            print(f"   Cache will be updated after each training step")
+            print(f"   Cache update frequency: Every {cache_freq} training steps")
+            print(f"   NOTE: Updating every step is too expensive with exact LP!")
         else:
             print(f"   WARNING: All states not set for cache (call agent.set_all_states_for_cache())")
     else:
@@ -689,8 +691,11 @@ def main():
     env = CompetitiveEnv(size=env_size)
     
     # Create Nash DQN agent
-    # Optionally enable cache updates after each training step for faster action selection
-    update_cache = True  # Set to True to pre-compute Nash for all states after each training step
+    # Optionally enable cache updates periodically for faster action selection
+    update_cache = True  # Set to True to pre-compute Nash for all states periodically
+    # Since train_step is already batched (256 samples), we can update cache more frequently
+    # cache_update_frequency=1 means every training step (which processes 256 samples)
+    cache_update_frequency = 1  # Update cache every N training steps (1 = every step, which is batched)
     agent = NashDQN(
         input_size=input_size,
         joint_action_size=joint_action_size,
@@ -703,7 +708,8 @@ def main():
         batch_size=batch_size,
         buffer_size=buffer_size,
         use_fast_nash=False, # Use fast approximate Nash solver
-        update_cache_after_training=update_cache
+        update_cache_after_training=update_cache,
+        cache_update_frequency=cache_update_frequency
     )
     
     # Set all states for cache (if cache updates are enabled)
@@ -715,7 +721,7 @@ def main():
                     state = env.state_to_features(pursuer_pos, evader_pos)
                     all_states_for_cache.append(state)
         agent.set_all_states_for_cache(all_states_for_cache)
-        print(f"Cache update enabled: Will pre-compute Nash for {len(all_states_for_cache)} states after each training step")
+        print(f"Cache update enabled: Will pre-compute Nash for {len(all_states_for_cache)} states every {cache_update_frequency} training steps")
     
     # Get device information
     import torch
@@ -793,6 +799,9 @@ def main():
     
     # Evaluate from all start position pairs
     evaluate_all_starts(env, agent, max_steps=50, outdir=outdir)
+    
+    # Cleanup resources
+    agent.cleanup()
     
     print("\nTraining and evaluation complete!")
     print(f"All results saved to the '{outdir}' directory.")

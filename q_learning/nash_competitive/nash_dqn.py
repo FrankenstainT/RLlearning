@@ -244,6 +244,7 @@ class NashDQN:
                  batch_size: int = 64, buffer_size: int = 50000,
                  use_fast_nash: bool = True,
                  update_cache_after_training: bool = False,
+                 cache_update_frequency: int = 1,
                  num_workers: int = None):
         self.joint_action_size = joint_action_size
         self.gamma = gamma
@@ -280,6 +281,9 @@ class NashDQN:
         # Separate caches for Q-network and target network
         self._nash_cache_q = {}  # Cache for main Q-network
         self._nash_cache_max_size = 5000  # Limit cache size to prevent memory issues
+        
+        # Persistent worker pool for multiprocessing (reuse instead of spawning each time)
+        self._worker_pool = None
 
 
     
@@ -400,9 +404,13 @@ class NashDQN:
         # Soft update target network
         self._soft_update_target_network()
         
-        # Optionally update cache for all states after training step
-        # This pre-computes Nash equilibria so action selection is faster
-        if self.update_cache_after_training and hasattr(self, '_all_states_for_cache'):
+        # Optionally update cache for all states periodically
+        # Since train_step is already batched, we can update cache more frequently
+        # The cache update frequency is relative to training steps (which are batched)
+        self._training_steps += 1
+        if (self.update_cache_after_training and 
+            hasattr(self, '_all_states_for_cache') and
+            self._training_steps % self.cache_update_frequency == 0):
             self._update_cache_for_all_states()
     
     def _soft_update_target_network(self):
@@ -502,6 +510,20 @@ class NashDQN:
         """Solve Nash equilibrium given Q-values (helper for parallel processing)."""
         return _solve_nash_for_q_values_helper(q_values, self.use_fast_nash)
     
+    def _get_worker_pool(self):
+        """Get or create persistent worker pool for multiprocessing."""
+        if self._worker_pool is None and HAS_MULTIPROCESSING and self.num_workers > 1:
+            # Create persistent pool (only once)
+            self._worker_pool = Pool(processes=self.num_workers)
+        return self._worker_pool
+    
+    def _close_worker_pool(self):
+        """Close worker pool if it exists."""
+        if self._worker_pool is not None:
+            self._worker_pool.close()
+            self._worker_pool.join()
+            self._worker_pool = None
+    
     def _update_cache_for_all_states(self):
         """Update cache for all states in parallel (called after training step)."""
         if not hasattr(self, '_all_states_for_cache') or not self._all_states_for_cache:
@@ -512,14 +534,16 @@ class NashDQN:
         # Batch compute all Q-values on GPU (very fast)
         q_values_batch = self._batch_compute_q_values(all_states)
         
-        # Solve Nash equilibria
-        # Note: Multiprocessing is disabled when CUDA is available or on Windows
-        # We use sequential processing but still benefit from batch GPU computation above
+        # Solve Nash equilibria using persistent worker pool
         if HAS_MULTIPROCESSING and self.num_workers > 1 and len(all_states) > 10:
-            # Parallel processing (use module-level function) - only on non-Windows
-            solve_func = partial(_solve_nash_for_q_values_helper, use_fast_nash=self.use_fast_nash)
-            with Pool(processes=self.num_workers) as pool:
+            # Use persistent worker pool (reused, not recreated each time)
+            pool = self._get_worker_pool()
+            if pool is not None:
+                solve_func = partial(_solve_nash_for_q_values_helper, use_fast_nash=self.use_fast_nash)
                 results = pool.map(solve_func, q_values_batch)
+            else:
+                # Fallback to sequential
+                results = [self._solve_nash_for_q_values(qv) for qv in q_values_batch]
         else:
             # Sequential processing (Windows or small batches)
             # Still fast because Q-values were computed in batch on GPU
@@ -544,12 +568,16 @@ class NashDQN:
         # Batch compute all Q-values on GPU (much faster than one-by-one)
         q_values_batch = self._batch_compute_q_values(all_states)
         
-        # Solve Nash equilibria
+        # Solve Nash equilibria using persistent worker pool
         if HAS_MULTIPROCESSING and self.num_workers > 1 and len(all_states) > 10:
-            # Parallel processing (use module-level function for pickling)
-            solve_func = partial(_solve_nash_for_q_values_helper, use_fast_nash=self.use_fast_nash)
-            with Pool(processes=self.num_workers) as pool:
+            # Use persistent worker pool (reused, not recreated each time)
+            pool = self._get_worker_pool()
+            if pool is not None:
+                solve_func = partial(_solve_nash_for_q_values_helper, use_fast_nash=self.use_fast_nash)
                 results = pool.map(solve_func, q_values_batch)
+            else:
+                # Fallback to sequential
+                results = [self._solve_nash_for_q_values(qv) for qv in q_values_batch]
         else:
             # Sequential processing (fallback)
             results = [self._solve_nash_for_q_values(qv) for qv in q_values_batch]
@@ -572,4 +600,8 @@ class NashDQN:
     def clear_cache(self):
         """Clear the Nash equilibrium cache."""
         self._nash_cache_q.clear()
+    
+    def cleanup(self):
+        """Clean up resources (close worker pool)."""
+        self._close_worker_pool()
 
