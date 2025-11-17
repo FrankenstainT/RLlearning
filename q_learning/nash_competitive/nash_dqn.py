@@ -577,6 +577,7 @@ def solve_nash_equilibrium_lp_torch_batch(q_values_batch) -> Tuple:
                             except (TypeError, AttributeError):
                                 # If gpu parameter not supported, try without it
                                 problem.solve(solver=cp.MPAX, verbose=False, warm_start=False)
+                            print(f"[MPAX debug] status={problem.status}, solver_stats={problem.solver_stats}")
                             if problem.status == 'optimal' and z.value is not None:
                                 z_sol = z.value
                                 x = z_sol[:m]
