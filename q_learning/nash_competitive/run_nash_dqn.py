@@ -11,7 +11,7 @@ import time
 # Add parent directory to path to import shared modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from competitive_env import CompetitiveEnv
-from nash_dqn import NashDQN, HAS_MULTIPROCESSING, IS_WINDOWS, CUDA_AVAILABLE
+from nash_dqn import NashDQN, IS_WINDOWS, get_has_multiprocessing, get_cuda_available
 from visualization import frames_to_gif
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -602,7 +602,9 @@ def print_parallelization_status(agent, env):
         print(f"   Device: {torch.cuda.get_device_name(0)}")
     
     # 2. Multiprocessing for batch linear programming
-    multiprocessing_enabled = (HAS_MULTIPROCESSING and 
+    has_multiprocessing = get_has_multiprocessing()
+    cuda_available = get_cuda_available()
+    multiprocessing_enabled = (has_multiprocessing and 
                               agent.num_workers > 1 and 
                               hasattr(env, 'valid_positions'))
     if multiprocessing_enabled:
@@ -614,7 +616,7 @@ def print_parallelization_status(agent, env):
     print(f"2. Multiprocessing for batch linear programming: {'✓ ENABLED' if multiprocessing_enabled else '✗ DISABLED'}")
     if multiprocessing_enabled:
         print(f"   Workers: {agent.num_workers}")
-        if CUDA_AVAILABLE and not IS_WINDOWS:
+        if cuda_available and not IS_WINDOWS:
             print(f"   Start method: spawn (required for CUDA)")
         elif IS_WINDOWS:
             print(f"   Start method: spawn (Windows default)")
@@ -622,11 +624,11 @@ def print_parallelization_status(agent, env):
             print(f"   Start method: fork (Linux default)")
     else:
         reasons = []
-        if not HAS_MULTIPROCESSING:
+        if not has_multiprocessing:
             reasons.append("multiprocessing not available")
         if agent.num_workers <= 1:
             reasons.append(f"num_workers={agent.num_workers}")
-        if CUDA_AVAILABLE and IS_WINDOWS:
+        if cuda_available and IS_WINDOWS:
             reasons.append("Windows with CUDA (spawn overhead)")
         print(f"   Reason: {', '.join(reasons) if reasons else 'small batch size'}")
     
