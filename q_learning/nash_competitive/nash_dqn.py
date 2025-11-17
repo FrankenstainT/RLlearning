@@ -256,6 +256,7 @@ class NashDQN:
         self.batch_size = batch_size
         self.use_fast_nash = use_fast_nash  # Use fast approximate Nash for 4x4 games
         self.update_cache_after_training = update_cache_after_training  # Update cache after each training step
+        self.cache_update_frequency = cache_update_frequency  # Update cache every N training steps
         self.num_workers = num_workers if num_workers is not None else (cpu_count() if HAS_MULTIPROCESSING else 1)
         
         # Device
