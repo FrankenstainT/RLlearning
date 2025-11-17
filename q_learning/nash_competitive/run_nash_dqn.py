@@ -191,8 +191,8 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
             seconds = int(elapsed_time % 60)
             time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
             print(f"Episode {episode + 1}/{num_episodes} - "
-                  f"Pursuer Avg Reward (last 100): {np.mean(pursuer_rewards[-print_interval:]):.2f}, "
-                  f"Evader Avg Reward (last 100): {np.mean(evader_rewards[-print_interval:]):.2f}, "
+                  f"Pursuer Avg Reward (last {print_interval}): {np.mean(pursuer_rewards[-print_interval:]):.2f}, "
+                  f"Evader Avg Reward (last {print_interval}): {np.mean(evader_rewards[-print_interval:]):.2f}, "
                   f"Avg Steps: {np.mean(episode_lengths[-print_interval:]):.2f}, "
                   f"Pursuer Win Rate (last {print_interval}): {pursuer_wins/print_interval:.2%}, "
                   f"Epsilon: {agent.epsilon:.4f}, "
@@ -676,7 +676,7 @@ def main():
     import torch
     torch.manual_seed(random_seed)
     
-    outdir = 'nash_results'
+    outdir = 'nash_results_light'
     os.makedirs(outdir, exist_ok=True)
     
     # Environment parameters
@@ -688,15 +688,15 @@ def main():
     hidden_size = 128
     learning_rate = 5e-4
     gamma = 0.95
-    epsilon_start = 0.5
-    epsilon_end = 0.01
+    epsilon_start = 0.3
+    epsilon_end = 0.001
     epsilon_decay = 0.995
     tau = 0.01
     batch_size = 256  # Increased for better GPU utilization
     buffer_size = 50000
     
     # Training parameters
-    num_episodes = 3000
+    num_episodes = 1000
     max_steps = 50
     
     # Create environment
