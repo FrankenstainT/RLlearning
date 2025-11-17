@@ -15,9 +15,42 @@ from typing import Tuple, Dict, List
 from scipy.optimize import linprog
 import sys
 import os
+from functools import partial
 # Add parent directory to path to import shared modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dqn_learning import ReplayBuffer
+
+# Try to import parallel processing
+# Note: Multiprocessing on Windows with PyTorch causes memory issues
+# We'll use sequential processing but still benefit from batch GPU computation
+import platform
+IS_WINDOWS = platform.system() == 'Windows'
+
+try:
+    if not IS_WINDOWS:
+        from multiprocessing import Pool, cpu_count
+        HAS_MULTIPROCESSING = True
+    else:
+        # Disable multiprocessing on Windows to avoid memory issues
+        HAS_MULTIPROCESSING = False
+        from multiprocessing import cpu_count
+except ImportError:
+    HAS_MULTIPROCESSING = False
+    cpu_count = lambda: 1
+
+# Try to import faster LP solvers
+try:
+    import highspy
+    HAS_HIGHSPY = True
+except ImportError:
+    HAS_HIGHSPY = False
+
+try:
+    from scipy.optimize import linprog
+    # Use HiGHS method if available (faster than default)
+    LP_METHOD = "highs" if hasattr(linprog, '__defaults__') else "interior-point"
+except:
+    LP_METHOD = "interior-point"
 
 
 class NashDQNNetwork(nn.Module):
@@ -37,13 +70,77 @@ class NashDQNNetwork(nn.Module):
         return x
 
 
-def solve_nash_equilibrium(M: np.ndarray, jitter=1e-8, max_retries=2):
+def solve_nash_equilibrium_fast_4x4(M: np.ndarray):
+    """
+    Fast approximate Nash solver for 4x4 games using iterative best response.
+    Much faster than LP for small games.
+    """
+    M = np.asarray(M, float)
+    m, n = M.shape
+    
+    # Initialize with uniform
+    x = np.ones(m) / m
+    y = np.ones(n) / n
+    
+    # Iterative best response (typically converges in < 10 iterations for 4x4)
+    for _ in range(20):  # Max iterations
+        # Best response for pursuer (maximizer)
+        pursuer_payoffs = M @ y
+        best_pursuer = np.argmax(pursuer_payoffs)
+        x_new = np.zeros(m)
+        x_new[best_pursuer] = 1.0
+        
+        # Best response for evader (minimizer)
+        evader_payoffs = x @ M
+        best_evader = np.argmin(evader_payoffs)
+        y_new = np.zeros(n)
+        y_new[best_evader] = 1.0
+        
+        # Check convergence
+        if np.allclose(x, x_new) and np.allclose(y, y_new):
+            break
+        
+        # Soft update (mixing parameter for stability)
+        x = 0.7 * x + 0.3 * x_new
+        y = 0.7 * y + 0.3 * y_new
+    
+    # Compute value
+    v = float(x @ M @ y)
+    return x, y, v
+
+
+def _solve_nash_for_q_values_helper(q_values: np.ndarray, use_fast_nash: bool) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Helper function for parallel Nash solving (must be module-level for multiprocessing)."""
+    M = _q_values_to_matrix_static(q_values)
+    return solve_nash_equilibrium(M, use_fast_approx=use_fast_nash)
+
+
+def _q_values_to_matrix_static(q_values: np.ndarray) -> np.ndarray:
+    """Convert Q-values (16) to payoff matrix (4x4) - static version for multiprocessing."""
+    M = np.zeros((4, 4))
+    for pursuer_action in range(4):
+        for evader_action in range(4):
+            joint_idx = pursuer_action * 4 + evader_action
+            M[pursuer_action, evader_action] = q_values[joint_idx]
+    return M
+
+
+def solve_nash_equilibrium(M: np.ndarray, jitter=1e-8, max_retries=2, use_fast_approx=False):
     """
     Solve Nash equilibrium using linear programming.
     M is a matrix where M[i, j] is the payoff for pursuer action i and evader action j.
     Returns (pursuer_policy, evader_policy, value) for the pursuer's perspective.
+    
+    Args:
+        use_fast_approx: If True and M is 4x4, use fast iterative method instead of LP
     """
     M = np.asarray(M, float)
+    m, n = M.shape
+    
+    # For 4x4 games, use fast approximate method if requested
+    if use_fast_approx and m == 4 and n == 4:
+        return solve_nash_equilibrium_fast_4x4(M)
+    
     # sanitize
     if not np.all(np.isfinite(M)):
         M = np.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
@@ -54,7 +151,6 @@ def solve_nash_equilibrium(M: np.ndarray, jitter=1e-8, max_retries=2):
     s = float(np.max(np.abs(Ms)))
     if s < 1e-12:
         # essentially constant matrix
-        m, n = M.shape
         x = np.ones(m) / m
         y = np.ones(n) / n
         v = mu
@@ -62,44 +158,41 @@ def solve_nash_equilibrium(M: np.ndarray, jitter=1e-8, max_retries=2):
     Ms /= s
     
     def _solve_raw(A):
-        m, n = A.shape
         num = m + n + 1
         xs = slice(0, m)
         ys = slice(m, m + n)
         vidx = m + n
         
-        c = np.zeros(num)
+        c = np.zeros(num, dtype=np.float64)
         c[vidx] = -1.0
-        A_ub = []
-        b_ub = []
+        
+        # Pre-allocate constraint matrices for better performance
+        A_ub = np.zeros((m + n, num), dtype=np.float64)
+        b_ub = np.zeros(m + n, dtype=np.float64)
         
         # v <= x^T A[:,j] for all j (evader actions)
         for j in range(n):
-            row = np.zeros(num)
-            row[xs] = -A[:, j]
-            row[vidx] = 1.0
-            A_ub.append(row)
-            b_ub.append(0.0)
+            A_ub[j, xs] = -A[:, j]
+            A_ub[j, vidx] = 1.0
+            b_ub[j] = 0.0
         
         # A[i,:] y <= v for all i (pursuer actions)
         for i in range(m):
-            row = np.zeros(num)
-            row[ys] = A[i, :]
-            row[vidx] = -1.0
-            A_ub.append(row)
-            b_ub.append(0.0)
+            A_ub[n + i, ys] = A[i, :]
+            A_ub[n + i, vidx] = -1.0
+            b_ub[n + i] = 0.0
         
-        A_ub = np.vstack(A_ub)
-        b_ub = np.array(b_ub)
-        A_eq = np.zeros((2, num))
+        A_eq = np.zeros((2, num), dtype=np.float64)
         A_eq[0, xs] = 1.0
         A_eq[1, ys] = 1.0
-        b_eq = np.array([1.0, 1.0])
+        b_eq = np.array([1.0, 1.0], dtype=np.float64)
         bounds = [(0, None)] * m + [(0, None)] * n + [(None, None)]
         
+        # Use fastest available method
         res = linprog(c, A_ub=A_ub, b_ub=b_ub,
                      A_eq=A_eq, b_eq=b_eq,
-                     bounds=bounds, method="highs")
+                     bounds=bounds, method=LP_METHOD,
+                     options={'maxiter': 1000, 'presolve': True})
         return res
     
     # try solve, with jittered retries if needed
@@ -108,7 +201,6 @@ def solve_nash_equilibrium(M: np.ndarray, jitter=1e-8, max_retries=2):
         res = _solve_raw(A)
         if res.status == 0 and np.isfinite(res.fun):
             z = res.x
-            m, n = Ms.shape
             x = np.clip(z[:m], 0, None)
             y = np.clip(z[m:m + n], 0, None)
             v = float(z[m + n])
@@ -122,7 +214,6 @@ def solve_nash_equilibrium(M: np.ndarray, jitter=1e-8, max_retries=2):
         A = Ms + np.random.default_rng().normal(scale=jitter, size=Ms.shape)
     
     # last resort: return uniform
-    m, n = M.shape
     x = np.ones(m) / m
     y = np.ones(n) / n
     v = float(np.mean(M))
@@ -136,7 +227,10 @@ class NashDQN:
                  learning_rate: float = 5e-4, gamma: float = 0.95, 
                  epsilon_start: float = 0.5, epsilon_end: float = 0.01, 
                  epsilon_decay: float = 0.995, tau: float = 0.01,
-                 batch_size: int = 64, buffer_size: int = 50000):
+                 batch_size: int = 64, buffer_size: int = 50000,
+                 use_fast_nash: bool = True,
+                 update_cache_after_training: bool = False,
+                 num_workers: int = None):
         self.joint_action_size = joint_action_size
         self.gamma = gamma
         self.epsilon_start = epsilon_start
@@ -145,6 +239,9 @@ class NashDQN:
         self.epsilon = epsilon_start
         self.tau = tau
         self.batch_size = batch_size
+        self.use_fast_nash = use_fast_nash  # Use fast approximate Nash for 4x4 games
+        self.update_cache_after_training = update_cache_after_training  # Update cache after each training step
+        self.num_workers = num_workers if num_workers is not None else (cpu_count() if HAS_MULTIPROCESSING else 1)
         
         # Device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -197,8 +294,9 @@ class NashDQN:
         # Convert to payoff matrix
         M = self._q_values_to_matrix(q_values)
         
-        # Solve Nash equilibrium
-        pursuer_policy, evader_policy, value = solve_nash_equilibrium(M)
+        # Solve Nash equilibrium (use fast approx for 4x4 games if enabled)
+        pursuer_policy, evader_policy, value = solve_nash_equilibrium(
+            M, use_fast_approx=self.use_fast_nash)
         
         # Cache result (with size limit)
         if len(self._nash_cache_q) >= self._nash_cache_max_size:
@@ -287,6 +385,11 @@ class NashDQN:
         
         # Soft update target network
         self._soft_update_target_network()
+        
+        # Optionally update cache for all states after training step
+        # This pre-computes Nash equilibria so action selection is faster
+        if self.update_cache_after_training and hasattr(self, '_all_states_for_cache'):
+            self._update_cache_for_all_states()
     
     def _soft_update_target_network(self):
         """Soft update target network using tau."""
@@ -338,8 +441,9 @@ class NashDQN:
         # Convert to payoff matrix
         M = self._q_values_to_matrix(q_values)
         
-        # Solve Nash equilibrium
-        pursuer_policy, evader_policy, value = solve_nash_equilibrium(M)
+        # Solve Nash equilibrium (use fast approx for 4x4 games if enabled)
+        pursuer_policy, evader_policy, value = solve_nash_equilibrium(
+            M, use_fast_approx=self.use_fast_nash)
         return pursuer_policy, evader_policy, value
     
     def get_value(self, state: np.ndarray) -> float:
@@ -366,16 +470,78 @@ class NashDQN:
         _, evader_policy, _ = self._solve_nash_for_state(state)
         return evader_policy
     
+    def _batch_compute_q_values(self, states: List[np.ndarray]) -> np.ndarray:
+        """Batch compute Q-values for multiple states on GPU."""
+        if not states:
+            return np.array([])
+        
+        # Stack all states into a batch tensor
+        states_tensor = torch.from_numpy(np.array(states, dtype=np.float32)).to(self.device)
+        
+        # Forward pass on GPU (batch computation)
+        with torch.no_grad():
+            q_values_batch = self.q_network(states_tensor)  # [batch_size, 16]
+        
+        return q_values_batch.cpu().numpy()
+    
+    def _solve_nash_for_q_values(self, q_values: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Solve Nash equilibrium given Q-values (helper for parallel processing)."""
+        return _solve_nash_for_q_values_helper(q_values, self.use_fast_nash)
+    
+    def _update_cache_for_all_states(self):
+        """Update cache for all states in parallel (called after training step)."""
+        if not hasattr(self, '_all_states_for_cache') or not self._all_states_for_cache:
+            return
+        
+        all_states = self._all_states_for_cache
+        
+        # Batch compute all Q-values on GPU (very fast)
+        q_values_batch = self._batch_compute_q_values(all_states)
+        
+        # Solve Nash equilibria
+        # Note: On Windows, multiprocessing causes memory issues with PyTorch
+        # We use sequential processing but still benefit from batch GPU computation above
+        if HAS_MULTIPROCESSING and not IS_WINDOWS and self.num_workers > 1 and len(all_states) > 10:
+            # Parallel processing (use module-level function) - only on non-Windows
+            solve_func = partial(_solve_nash_for_q_values_helper, use_fast_nash=self.use_fast_nash)
+            with Pool(processes=self.num_workers) as pool:
+                results = pool.map(solve_func, q_values_batch)
+        else:
+            # Sequential processing (Windows or small batches)
+            # Still fast because Q-values were computed in batch on GPU
+            results = [self._solve_nash_for_q_values(qv) for qv in q_values_batch]
+        
+        # Update cache
+        for state, (pursuer_policy, evader_policy, value) in zip(all_states, results):
+            state_key = tuple(state)
+            self._nash_cache_q[state_key] = (pursuer_policy, evader_policy, value)
+    
+    def set_all_states_for_cache(self, all_states: List[np.ndarray]):
+        """Set the list of all states to cache (call this once at the start of training)."""
+        self._all_states_for_cache = all_states
+    
     def snapshot_policies_and_values(self, env, all_states: List[np.ndarray]) -> Dict:
-        """Snapshot current policies and values for all states."""
+        """Snapshot current policies and values for all states (parallelized version)."""
         policies = {}
         values = {}
         pursuer_policies = {}
         evader_policies = {}
         
-        for state in all_states:
+        # Batch compute all Q-values on GPU (much faster than one-by-one)
+        q_values_batch = self._batch_compute_q_values(all_states)
+        
+        # Solve Nash equilibria in parallel
+        if HAS_MULTIPROCESSING and self.num_workers > 1 and len(all_states) > 10:
+            # Parallel processing
+            with Pool(processes=self.num_workers) as pool:
+                results = pool.map(self._solve_nash_for_q_values, q_values_batch)
+        else:
+            # Sequential processing (fallback)
+            results = [self._solve_nash_for_q_values(qv) for qv in q_values_batch]
+        
+        # Organize results
+        for state, (pursuer_policy, evader_policy, value) in zip(all_states, results):
             state_key = tuple(state)
-            pursuer_policy, evader_policy, value = self._solve_nash_for_state(state)
             policies[state_key] = np.outer(pursuer_policy, evader_policy).flatten()
             pursuer_policies[state_key] = pursuer_policy
             evader_policies[state_key] = evader_policy

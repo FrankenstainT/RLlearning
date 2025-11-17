@@ -108,18 +108,18 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
             state = next_state
         
         # If episode ended due to max_steps, add final step with 0 reward
-        if not done and steps >= max_steps:
-            pursuer_action, evader_action = agent.choose_joint_action(state, training=True)
-            joint_action_idx = env.joint_action_to_index(pursuer_action, evader_action)
+        # if not done and steps >= max_steps:
+        #     pursuer_action, evader_action = agent.choose_joint_action(state, training=True)
+        #     joint_action_idx = env.joint_action_to_index(pursuer_action, evader_action)
             
-            final_reward = 0.0
-            final_done = True
+        #     final_reward = 0.0
+        #     final_done = True
             
-            agent.update(state, joint_action_idx, final_reward, state, final_done)
-            agent.train_step()
+        #     agent.update(state, joint_action_idx, final_reward, state, final_done)
+        #     agent.train_step()
             
-            pursuer_total_reward += final_reward
-            evader_total_reward += final_reward
+        #     pursuer_total_reward += final_reward
+        #     evader_total_reward += final_reward
         
         # End episode and get average TD error
         avg_td = agent.end_episode()
@@ -621,6 +621,8 @@ def main():
     env = CompetitiveEnv(size=env_size)
     
     # Create Nash DQN agent
+    # Optionally enable cache updates after each training step for faster action selection
+    update_cache = True  # Set to True to pre-compute Nash for all states after each training step
     agent = NashDQN(
         input_size=input_size,
         joint_action_size=joint_action_size,
@@ -631,8 +633,21 @@ def main():
         epsilon_decay=epsilon_decay,
         tau=tau,
         batch_size=batch_size,
-        buffer_size=buffer_size
+        buffer_size=buffer_size,
+        use_fast_nash=False, # Use fast approximate Nash solver
+        update_cache_after_training=update_cache
     )
+    
+    # Set all states for cache (if cache updates are enabled)
+    if update_cache:
+        all_states_for_cache = []
+        for pursuer_pos in env.valid_positions:
+            for evader_pos in env.valid_positions:
+                if pursuer_pos != evader_pos:
+                    state = env.state_to_features(pursuer_pos, evader_pos)
+                    all_states_for_cache.append(state)
+        agent.set_all_states_for_cache(all_states_for_cache)
+        print(f"Cache update enabled: Will pre-compute Nash for {len(all_states_for_cache)} states after each training step")
     
     # Get device information
     import torch
