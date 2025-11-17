@@ -588,8 +588,8 @@ def solve_nash_equilibrium_lp_torch_batch(q_values_batch) -> Tuple:
                                 if solver_used is None:
                                     solver_used = "CVXPY: MPAX"
                                 solved = True
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f"[solve_nash_equilibrium_lp_torch_batch] MPAX solve failed: {type(e).__name__}: {e}")
                     
                     # Priority 3: CuClarabel
                     if not solved and ('CUCLARABEL' in installed_solvers or 'CuClarabel' in installed_solvers):
