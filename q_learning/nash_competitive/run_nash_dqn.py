@@ -688,7 +688,7 @@ def main():
     hidden_size = 128
     learning_rate = 5e-4
     gamma = 0.95
-    epsilon_start = 0.3
+    epsilon_start = 0.5
     epsilon_end = 0.001
     epsilon_decay = 0.995
     tau = 0.01
