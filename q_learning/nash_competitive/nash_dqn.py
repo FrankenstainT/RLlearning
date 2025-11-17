@@ -576,7 +576,8 @@ class NashDQN:
                  update_cache_after_training: bool = False,
                  cache_update_frequency: int = 1,
                  num_workers: int = None,
-                 enable_multiprocessing: bool | None = None):
+                 enable_multiprocessing: bool | None = None,
+                 target_cache_refresh_interval: int = 1):
         self.joint_action_size = joint_action_size
         self.gamma = gamma
         self.epsilon_start = epsilon_start
@@ -594,6 +595,8 @@ class NashDQN:
         if enable_multiprocessing is None:
             enable_multiprocessing = get_has_multiprocessing()
         self.enable_multiprocessing = bool(enable_multiprocessing and get_has_multiprocessing() and self.num_workers > 1)
+        self.target_cache_refresh_interval = max(1, int(target_cache_refresh_interval))
+        self._target_cache_updates_since_clear = 0
         
         # Torch optimizer
         optim = torch.optim
@@ -771,8 +774,10 @@ class NashDQN:
                                             self.q_network.parameters()):
             target_param.data.copy_(self.tau * local_param.data + 
                                    (1.0 - self.tau) * target_param.data)
-        # Target network changed, invalidate its cache
-        self._nash_cache_target.clear()
+        self._target_cache_updates_since_clear += 1
+        if self._target_cache_updates_since_clear >= self.target_cache_refresh_interval:
+            self._nash_cache_target.clear()
+            self._target_cache_updates_since_clear = 0
     
     def start_episode(self):
         """Called at the start of each episode."""

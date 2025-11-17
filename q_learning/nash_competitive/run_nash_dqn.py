@@ -46,7 +46,10 @@ def policy_entropy(p: np.ndarray) -> float:
 
 
 def train_agent(env: CompetitiveEnv, agent: NashDQN, 
-                num_episodes: int = 30000, max_steps: int = 50):
+                num_episodes: int = 30000, max_steps: int = 50,
+                log_interval: int = 500,
+                track_policy_drift: bool = True,
+                print_interval: int | None = None):
     """Train the Nash DQN agent."""
     pursuer_rewards = []
     evader_rewards = []
@@ -67,6 +70,8 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
                 all_states.append(state)
     
     prev_snapshot = None
+    if print_interval is None:
+        print_interval = max(1, log_interval) if log_interval else 500
     
     print(f"Training for {num_episodes} episodes...")
     start_time = time.time()
@@ -137,9 +142,8 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
         
         # Decay epsilon
         agent.decay_epsilon()
-        log_interval = 500
         # Track policy entropy and drift (less frequently to save time)
-        if episode % log_interval == 0:  # Every 500 episodes (reduced from 100)
+        if track_policy_drift and log_interval and (episode+1) % log_interval == 0:
             # Compute average policy entropy
             entropies = []
             for state in all_states:  # Reduced sample size for efficiency
@@ -179,7 +183,6 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
                 policy_l1_diffs.append(0.0)
             
             prev_snapshot = current_snapshot
-        print_interval = 500
         if (episode + 1) % print_interval == 0:
             pursuer_wins = sum(1 for w in episode_winners[-print_interval:] if w == "Pursuer")
             elapsed_time = time.time() - start_time
@@ -692,7 +695,7 @@ def main():
     buffer_size = 50000
     
     # Training parameters
-    num_episodes = 20000
+    num_episodes = 10000
     max_steps = 50
     
     # Create environment
@@ -705,6 +708,7 @@ def main():
     # cache_update_frequency=1 means every training step (which processes 256 samples)
     cache_update_frequency = 1  # Update cache every N training steps (1 = every step, which is batched)
     enable_multiprocessing = False  # Set True to allow worker pool usage for snapshots/cache
+    target_cache_refresh_interval = 25  # Clear target Nash cache every N soft updates
     agent = NashDQN(
         input_size=input_size,
         joint_action_size=joint_action_size,
@@ -719,7 +723,8 @@ def main():
         use_fast_nash=True, # Use fast approximate Nash solver
         update_cache_after_training=update_cache,
         cache_update_frequency=cache_update_frequency,
-        enable_multiprocessing=enable_multiprocessing
+        enable_multiprocessing=enable_multiprocessing,
+        target_cache_refresh_interval=target_cache_refresh_interval
     )
     
     # Set all states for cache (if cache updates are enabled)
@@ -767,6 +772,7 @@ def main():
             'batch_size': batch_size,
             'buffer_size': buffer_size,
             'enable_multiprocessing': enable_multiprocessing,
+            'target_cache_refresh_interval': target_cache_refresh_interval,
         },
         'training': {
             'num_episodes': num_episodes,
@@ -798,7 +804,15 @@ def main():
     # Train agent
     (pursuer_rewards, evader_rewards, episode_lengths, td_errors,
      episode_winners, policy_entropies, value_diffs_max, value_diffs_mean,
-     policy_l1_diffs) = train_agent(env, agent, num_episodes=num_episodes, max_steps=max_steps)
+     policy_l1_diffs) = train_agent(
+        env,
+        agent,
+        num_episodes=num_episodes,
+        max_steps=max_steps,
+        log_interval=500,  # Disable expensive drift tracking
+        track_policy_drift=True,
+        print_interval=500
+    )
     
     # Plot training progress
     plot_training_progress(pursuer_rewards, evader_rewards, episode_lengths, td_errors,
