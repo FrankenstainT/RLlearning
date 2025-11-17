@@ -572,6 +572,7 @@ def solve_nash_equilibrium_lp_torch_batch(q_values_batch) -> Tuple:
                     if not solved and 'MPAX' in installed_solvers:
                         try:
                             # MPAX may not need gpu=True parameter, try both
+                            print("Now MPAX")
                             try:
                                 problem.solve(solver=cp.MPAX, gpu=True, verbose=False, warm_start=False)
                             except (TypeError, AttributeError):
