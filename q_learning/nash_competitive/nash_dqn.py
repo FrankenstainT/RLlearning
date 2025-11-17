@@ -709,6 +709,8 @@ class NashDQN:
         if len(self.replay_buffer) < self.batch_size:
             return
         
+        torch = _import_torch()
+        
         # Sample batch
         batch = self.replay_buffer.sample(self.batch_size)
         
@@ -860,6 +862,8 @@ class NashDQN:
         """Batch compute Q-values for multiple states on GPU."""
         if not states:
             return np.array([])
+        
+        torch = _import_torch()
         
         # Stack all states into a batch tensor
         states_tensor = torch.from_numpy(np.array(states, dtype=np.float32)).to(self.device)
