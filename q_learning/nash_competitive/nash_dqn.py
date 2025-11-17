@@ -407,348 +407,39 @@ def solve_nash_equilibrium_fast_4x4(M: np.ndarray):
 
 def solve_nash_equilibrium_lp_torch_batch(q_values_batch) -> Tuple:
     """
-    Exact Nash equilibrium solver using linear programming in PyTorch (GPU batch).
-    Implements primal-dual interior point method for true GPU batch processing.
+    Exact Nash equilibrium solver that processes each game sequentially on CPU.
+    This avoids GPU/CVXPY overhead and always calls the reference LP solver.
     
     Args:
-        q_values_batch: Tensor of shape [batch_size, 16] containing Q-values for each state
+        q_values_batch: Tensor of shape [batch_size, 16] containing Q-values for each state.
     
     Returns:
-        pursuer_policies: Tensor of shape [batch_size, 4]
-        evader_policies: Tensor of shape [batch_size, 4]
-        values: Tensor of shape [batch_size]
+        Tuple of tensors (pursuer_policies, evader_policies, values).
     """
-    # Lazy import torch (only when this function is called)
     torch = _import_torch()
     
+    if q_values_batch.dim() == 1:
+        q_values_batch = q_values_batch.unsqueeze(0)
+    
     device = q_values_batch.device
-    batch_size = q_values_batch.shape[0]
-    m, n = 4, 4  # 4x4 games
+    q_values_np = q_values_batch.detach().cpu().numpy()
     
-    # Reshape Q-values to [batch_size, 4, 4] matrices
-    M = q_values_batch.view(batch_size, m, n)
+    pursuer_policies = []
+    evader_policies = []
+    values = []
     
-    # Check for constant matrices
-    M_range = torch.max(M, dim=2)[0] - torch.min(M, dim=2)[0]  # [batch_size, 4]
-    M_range = torch.max(M_range, dim=1)[0]  # [batch_size]
-    is_constant = M_range < 1e-6
+    for q_values in q_values_np:
+        q_flat = np.array(q_values, dtype=np.float64).reshape(-1)
+        M = _q_values_to_matrix_static(q_flat)
+        x, y, v = solve_nash_equilibrium(M, use_fast_approx=False)
+        pursuer_policies.append(x)
+        evader_policies.append(y)
+        values.append(v)
     
-    # Handle constant matrices
-    if torch.any(is_constant):
-        x_result = torch.ones(batch_size, m, device=device) / m
-        y_result = torch.ones(batch_size, n, device=device) / n
-        v_result = M.mean(dim=(1, 2))
-        if torch.all(is_constant):
-            return x_result, y_result, v_result
-    
-    # Normalize for numerical stability
-    M_mean = M.mean(dim=(1, 2), keepdim=True)  # [batch_size, 1, 1]
-    M_centered = M - M_mean
-    M_scale = torch.max(torch.abs(M_centered), dim=2, keepdim=True)[0]  # [batch_size, 4, 1]
-    M_scale = torch.max(M_scale, dim=1, keepdim=True)[0]  # [batch_size, 1, 1]
-    M_scale = torch.clamp(M_scale, min=1e-12)
-    M_work = M_centered / M_scale  # [batch_size, 4, 4]
-    
-    # LP formulation: variables [x (m), y (n), v (1)]
-    num_vars = m + n + 1
-    
-    # Objective: minimize -v (maximize v)
-    c = torch.zeros(batch_size, num_vars, device=device)
-    c[:, m + n] = -1.0  # -v
-    
-    # Build constraint matrices
-    # Inequality constraints: A_ub @ z <= b_ub
-    # v <= x^T M[:,j] for all j -> -M[:,j]^T x + v <= 0
-    # M[i,:] y <= v for all i -> M[i,:] y - v <= 0
-    num_ineq = m + n
-    A_ub = torch.zeros(batch_size, num_ineq, num_vars, device=device)
-    b_ub = torch.zeros(batch_size, num_ineq, device=device)
-    
-    # v <= x^T M[:,j] for all j (n constraints)
-    for j in range(n):
-        A_ub[:, j, :m] = -M_work[:, :, j]  # -M[:,j]^T
-        A_ub[:, j, m + n] = 1.0  # +v
-    
-    # M[i,:] y <= v for all i (m constraints)
-    for i in range(m):
-        A_ub[:, n + i, m:m + n] = M_work[:, i, :]  # M[i,:]
-        A_ub[:, n + i, m + n] = -1.0  # -v
-    
-    # Equality constraints: A_eq @ z = b_eq
-    # sum(x) = 1, sum(y) = 1
-    A_eq = torch.zeros(batch_size, 2, num_vars, device=device)
-    A_eq[:, 0, :m] = 1.0  # sum(x) = 1
-    A_eq[:, 1, m:m + n] = 1.0  # sum(y) = 1
-    b_eq = torch.ones(batch_size, 2, device=device)
-    
-    # Try to use GPU-accelerated solver if available, otherwise use optimized CPU solvers
-    # Priority: GPU solvers (cuOpt, MPAX, CuClarabel) > HIGHS > SCIPY > exact CPU solver (linprog)
-    use_gpu_solver = False
-    
-    solver_used = None
-    
-    # Try CVXPY with GPU backends (includes cuOpt, MPAX, CuClarabel)
-    cvxpy = _check_cvxpy()
-    cuopt_available = _check_cuopt()
-    
-    if cvxpy and batch_size > 1:
-        try:
-            import cvxpy as cp
-            M_np = M.cpu().numpy()
-            
-            x_results = []
-            y_results = []
-            v_results = []
-            
-            for b in range(batch_size):
-                if is_constant[b]:
-                    x_results.append(np.ones(m) / m)
-                    y_results.append(np.ones(n) / n)
-                    v_results.append(float(M_np[b].mean()))
-                    if solver_used is None:
-                        solver_used = "Constant matrix shortcut (no LP solve)"
-                else:
-                    # Formulate LP using CVXPY
-                    num_vars = m + n + 1
-                    
-                    # Variables: x (m), y (n), v (1)
-                    z = cp.Variable(num_vars)
-                    x_var = z[:m]
-                    y_var = z[m:m + n]
-                    v_var = z[m + n]
-                    
-                    # Objective: maximize v (minimize -v)
-                    objective = cp.Minimize(-v_var)
-                    
-                    # Constraints
-                    constraints = [
-                        x_var >= 0,
-                        y_var >= 0,
-                        cp.sum(x_var) == 1,
-                        cp.sum(y_var) == 1,
-                    ]
-                    
-                    # v <= x^T M[:,j] for all j
-                    for j in range(n):
-                        constraints.append(v_var <= x_var @ M_np[b, :, j])
-                    
-                    # M[i,:] y <= v for all i
-                    for i in range(m):
-                        constraints.append(M_np[b, i, :] @ y_var <= v_var)
-                    
-                    # Solve with GPU solver if available
-                    problem = cp.Problem(objective, constraints)
-                    
-                    # Try GPU solvers in order of preference: cuOpt > MPAX > CuClarabel
-                    solved = False
-                    installed_solvers = cp.installed_solvers()
-                    
-                    # Priority 1: cuOpt (if available through CVXPY)
-                    # Note: cuOpt may not be available as a CVXPY solver by default
-                    # It requires custom integration or may be available in future CVXPY versions
-                    if cuopt_available and 'CUOPT' in installed_solvers:
-                        try:
-                            problem.solve(solver=cp.CUOPT, gpu=True, verbose=False, warm_start=False)
-                            if problem.status == 'optimal' and z.value is not None:
-                                z_sol = z.value
-                                x = z_sol[:m]
-                                y = z_sol[m:m + n]
-                                v = z_sol[m + n]
-                                x_results.append(x)
-                                y_results.append(y)
-                                v_results.append(v)
-                                if solver_used is None:
-                                    solver_used = "CVXPY: CUOPT"
-                                solved = True
-                        except Exception:
-                            pass
-                    
-                    # Note: cuOpt is installed but not available through CVXPY yet
-                    # cuOpt's Python API is primarily for routing problems
-                    # For LP problems, cuOpt would need to be used through its C API
-                    # or integrated with CVXPY via a custom solver class
-                    
-                    # Priority 2: MPAX
-                    if not solved and 'MPAX' in installed_solvers:
-                        try:
-                            # MPAX may not need gpu=True parameter, try both
-
-                            try:
-                                problem.solve(solver=cp.MPAX, gpu=True, verbose=False, warm_start=False)
-                            except (TypeError, AttributeError):
-                                # If gpu parameter not supported, try without it
-                                problem.solve(solver=cp.MPAX, verbose=False, warm_start=False)
-                            if problem.status == 'optimal' and z.value is not None:
-                                z_sol = z.value
-                                x = z_sol[:m]
-                                y = z_sol[m:m + n]
-                                v = z_sol[m + n]
-                                x_results.append(x)
-                                y_results.append(y)
-                                v_results.append(v)
-                                if solver_used is None:
-                                    solver_used = "CVXPY: MPAX"
-                                solved = True
-                        except Exception as e:
-                            print(f"[solve_nash_equilibrium_lp_torch_batch] MPAX solve failed: {type(e).__name__}: {e}")
-                    
-                    # Priority 3: CuClarabel
-                    if not solved and ('CUCLARABEL' in installed_solvers or 'CuClarabel' in installed_solvers):
-                        try:
-                            # Try both naming conventions
-                            solver_name = cp.CuClarabel if 'CuClarabel' in installed_solvers else cp.CUCLARABEL
-                            # CuClarabel may not need gpu=True parameter, try both
-                            try:
-                                problem.solve(solver=solver_name, gpu=True, verbose=False)
-                            except (TypeError, AttributeError):
-                                # If gpu parameter not supported, try without it
-                                problem.solve(solver=solver_name, verbose=False)
-                            if problem.status == 'optimal' and z.value is not None:
-                                z_sol = z.value
-                                x = z_sol[:m]
-                                y = z_sol[m:m + n]
-                                v = z_sol[m + n]
-                                x_results.append(x)
-                                y_results.append(y)
-                                v_results.append(v)
-                                if solver_used is None:
-                                    solver_used = "CVXPY: CuClarabel"
-                                solved = True
-                        except Exception:
-                            pass
-                    
-                    # Priority 4: HIGHS (high-performance CPU solver, often faster than scipy.optimize.linprog)
-                    if not solved and 'HIGHS' in installed_solvers:
-                        try:
-                            problem.solve(solver=cp.HIGHS, verbose=False)
-                            if problem.status == 'optimal' and z.value is not None:
-                                z_sol = z.value
-                                x = z_sol[:m]
-                                y = z_sol[m:m + n]
-                                v = z_sol[m + n]
-                                x_results.append(x)
-                                y_results.append(y)
-                                v_results.append(v)
-                                if solver_used is None:
-                                    solver_used = "CVXPY: HIGHS"
-                                solved = True
-                        except Exception:
-                            pass
-                    
-                    # Priority 5: SCIPY (CVXPY's scipy solver, may be optimized)
-                    if not solved and 'SCIPY' in installed_solvers:
-                        try:
-                            problem.solve(solver=cp.SCIPY, verbose=False)
-                            if problem.status == 'optimal' and z.value is not None:
-                                z_sol = z.value
-                                x = z_sol[:m]
-                                y = z_sol[m:m + n]
-                                v = z_sol[m + n]
-                                x_results.append(x)
-                                y_results.append(y)
-                                v_results.append(v)
-                                if solver_used is None:
-                                    solver_used = "CVXPY: SCIPY"
-                                solved = True
-                        except Exception:
-                            pass
-                    
-                    if not solved:
-                        # Fall back to exact solver (direct scipy.optimize.linprog)
-                        x, y, v = solve_nash_equilibrium(M_np[b], use_fast_approx=False)
-                        x_results.append(x)
-                        y_results.append(y)
-                        v_results.append(v)
-            
-            if len(x_results) == batch_size:
-                x = torch.from_numpy(np.array(x_results)).float().to(device)
-                y = torch.from_numpy(np.array(y_results)).float().to(device)
-                v = torch.from_numpy(np.array(v_results)).float().to(device)
-                use_gpu_solver = True
-        except Exception as e:
-            # Fall back to exact solver
-            use_gpu_solver = False
-    
-    if not use_gpu_solver:
-        # Use exact LP solver - this is the most reliable approach
-        # For true GPU batch processing, install cuOpt and complete integration
-        # This ensures exact solutions matching the reference
-        M_np = M.cpu().numpy()
-        
-        x_results = []
-        y_results = []
-        v_results = []
-        
-        for b in range(batch_size):
-            if is_constant[b]:
-                x_results.append(np.ones(m) / m)
-                y_results.append(np.ones(n) / n)
-                v_results.append(float(M_np[b].mean()))
-            else:
-                # Use exact LP solver
-                x, y, v = solve_nash_equilibrium(M_np[b], use_fast_approx=False)
-                x_results.append(x)
-                y_results.append(y)
-                v_results.append(v)
-        
-        # Convert back to tensors on the original device
-        x = torch.from_numpy(np.array(x_results)).float().to(device)
-        y = torch.from_numpy(np.array(y_results)).float().to(device)
-        v = torch.from_numpy(np.array(v_results)).float().to(device)
-        solver_used = solver_used or "CPU: scipy.optimize.linprog"
-    
-    if solver_used:
-        print(f"[solve_nash_equilibrium_lp_torch_batch] Solver used: {solver_used}")
-    # Check for NaN/Inf and replace with uniform if needed
-    x_nan = ~torch.isfinite(x).all(dim=1)
-    y_nan = ~torch.isfinite(y).all(dim=1)
-    v_nan = ~torch.isfinite(v).view(-1) if v.dim() > 0 else ~torch.isfinite(v)
-    has_nan = x_nan | y_nan | v_nan
-    if torch.any(has_nan):
-        # Replace NaN with uniform policies
-        x[has_nan] = 1.0 / m
-        y[has_nan] = 1.0 / n
-        v[has_nan] = M[has_nan].mean(dim=(1, 2))
-    
-    # Normalize to ensure valid probabilities
-    x = torch.clamp(x, min=0.0)
-    y = torch.clamp(y, min=0.0)
-    x = x / (x.sum(dim=1, keepdim=True) + 1e-10)
-    y = y / (y.sum(dim=1, keepdim=True) + 1e-10)
-    
-    # Denormalize value
-    M_scale_1d = M_scale.squeeze()
-    M_mean_1d = M_mean.squeeze()
-    if M_scale_1d.dim() == 0:
-        M_scale_1d = M_scale_1d.unsqueeze(0)
-    if M_mean_1d.dim() == 0:
-        M_mean_1d = M_mean_1d.unsqueeze(0)
-    v = v * M_scale_1d + M_mean_1d
-    
-    # Recompute value in original space for accuracy
-    v_recomputed = torch.bmm(torch.bmm(x.unsqueeze(1), M), y.unsqueeze(2)).squeeze(-1).squeeze(-1)
-    if v_recomputed.dim() == 0:
-        v_recomputed = v_recomputed.unsqueeze(0)
-    v = v_recomputed
-    
-    # Final NaN check after recomputation
-    x_nan_final = ~torch.isfinite(x).all(dim=1)
-    y_nan_final = ~torch.isfinite(y).all(dim=1)
-    v_nan_final = ~torch.isfinite(v).view(-1) if v.dim() > 0 else ~torch.isfinite(v)
-    has_nan_final = x_nan_final | y_nan_final | v_nan_final
-    if torch.any(has_nan_final):
-        x[has_nan_final] = 1.0 / m
-        y[has_nan_final] = 1.0 / n
-        v[has_nan_final] = M[has_nan_final].mean(dim=(1, 2))
-    
-    # Handle constant matrices
-    if torch.any(is_constant):
-        constant_mask = is_constant.unsqueeze(1)
-        x = torch.where(constant_mask, torch.ones(batch_size, m, device=device) / m, x)
-        y = torch.where(constant_mask, torch.ones(batch_size, n, device=device) / n, y)
-        v = torch.where(is_constant, M.mean(dim=(1, 2)), v)
-    
-    return x, y, v
+    x_tensor = torch.from_numpy(np.array(pursuer_policies, dtype=np.float32)).to(device)
+    y_tensor = torch.from_numpy(np.array(evader_policies, dtype=np.float32)).to(device)
+    v_tensor = torch.from_numpy(np.array(values, dtype=np.float32)).to(device)
+    return x_tensor, y_tensor, v_tensor
 
 
 def solve_nash_equilibrium_fast_4x4_torch_batch(q_values_batch) -> Tuple:
@@ -931,14 +622,14 @@ class NashDQN:
         
         # Cache for Nash policies and values (with size limit)
         # Separate caches for Q-network and target network
-        self._nash_cache_q = {}  # Cache for main Q-network
+        self._nash_cache_q = {}
+        self._nash_cache_target = {}
         self._nash_cache_max_size = 5000  # Limit cache size to prevent memory issues
         
         # Persistent worker pool for multiprocessing (reuse instead of spawning each time)
         self._worker_pool = None
         
         # Track network updates for cache invalidation
-        self._training_steps = 0
 
 
     
@@ -952,6 +643,15 @@ class NashDQN:
                 joint_idx = pursuer_action * 4 + evader_action
                 M[pursuer_action, evader_action] = q_values[joint_idx]
         return M
+    
+    def _cache_insert(self, cache: Dict[Tuple, Tuple[np.ndarray, np.ndarray, float]], 
+                      state_key: Tuple, value: Tuple[np.ndarray, np.ndarray, float]):
+        """Insert value into cache with simple FIFO eviction."""
+        if len(cache) >= self._nash_cache_max_size:
+            keys_to_remove = list(cache.keys())[:max(1, self._nash_cache_max_size // 2)]
+            for key in keys_to_remove:
+                cache.pop(key, None)
+        cache[state_key] = value
     
     def _solve_nash_for_state(self, state: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """Solve Nash equilibrium for a given state using Q-network. Returns (pursuer_policy, evader_policy, value)."""
@@ -972,12 +672,7 @@ class NashDQN:
             M, use_fast_approx=self.use_fast_nash)
         
         # Cache result (with size limit)
-        if len(self._nash_cache_q) >= self._nash_cache_max_size:
-            # Remove oldest entries (simple FIFO by clearing half)
-            keys_to_remove = list(self._nash_cache_q.keys())[:self._nash_cache_max_size // 2]
-            for key in keys_to_remove:
-                del self._nash_cache_q[key]
-        self._nash_cache_q[state_key] = (pursuer_policy, evader_policy, value)
+        self._cache_insert(self._nash_cache_q, state_key, (pursuer_policy, evader_policy, value))
         return pursuer_policy, evader_policy, value
     
     def choose_joint_action(self, state: np.ndarray, training: bool = True) -> Tuple[int, int]:
@@ -1071,15 +766,6 @@ class NashDQN:
         
         # Soft update target network
         self._soft_update_target_network()
-        
-        # Optionally update cache for all states periodically
-        # Since train_step is already batched, we can update cache more frequently
-        # The cache update frequency is relative to training steps (which are batched)
-        self._training_steps += 1
-        if (self.update_cache_after_training and 
-            hasattr(self, '_all_states_for_cache') and
-            self._training_steps % self.cache_update_frequency == 0):
-            self._update_cache_for_all_states()
     
     def _soft_update_target_network(self):
         """Soft update target network using tau."""
@@ -1087,6 +773,8 @@ class NashDQN:
                                             self.q_network.parameters()):
             target_param.data.copy_(self.tau * local_param.data + 
                                    (1.0 - self.tau) * target_param.data)
+        # Target network changed, invalidate its cache
+        self._nash_cache_target.clear()
     
     def start_episode(self):
         """Called at the start of each episode."""
@@ -1119,6 +807,10 @@ class NashDQN:
     
     def _solve_nash_for_state_target(self, state: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """Solve Nash equilibrium using target network."""
+        state_key = tuple(state)
+        if state_key in self._nash_cache_target:
+            return self._nash_cache_target[state_key]
+        
         # Get Q-values from target network
         with torch.no_grad():
             # Use torch.from_numpy for better performance (avoids copy)
@@ -1134,6 +826,8 @@ class NashDQN:
         # Solve Nash equilibrium (use fast approx for 4x4 games if enabled)
         pursuer_policy, evader_policy, value = solve_nash_equilibrium(
             M, use_fast_approx=self.use_fast_nash)
+        
+        self._cache_insert(self._nash_cache_target, state_key, (pursuer_policy, evader_policy, value))
         return pursuer_policy, evader_policy, value
     
     def get_value(self, state: np.ndarray) -> float:
@@ -1270,6 +964,7 @@ class NashDQN:
     def clear_cache(self):
         """Clear the Nash equilibrium cache."""
         self._nash_cache_q.clear()
+        self._nash_cache_target.clear()
     
     def cleanup(self):
         """Clean up resources (close worker pool)."""

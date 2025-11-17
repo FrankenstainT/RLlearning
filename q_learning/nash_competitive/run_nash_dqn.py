@@ -137,9 +137,9 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
         
         # Decay epsilon
         agent.decay_epsilon()
-        
+        log_interval = 500
         # Track policy entropy and drift (less frequently to save time)
-        if episode % 300 == 0:  # Every 500 episodes (reduced from 100)
+        if episode % log_interval == 0:  # Every 500 episodes (reduced from 100)
             # Compute average policy entropy
             entropies = []
             for state in all_states:  # Reduced sample size for efficiency
@@ -257,16 +257,16 @@ def plot_training_progress(pursuer_rewards: list, evader_rewards: list,
                      f"Pursuer Win Rate (MA={window})", "Episode", "Win Rate",
                      os.path.join(outdir, "win_rate.png"))
     
-    # Policy entropy (tracked every 300 episodes)
+    # Policy entropy (tracked every 500 episodes)
     if policy_entropies:
-        entropy_episodes = np.arange(0, len(policy_entropies)) * 300
+        entropy_episodes = np.arange(0, len(policy_entropies)) * log_interval
         plot_and_save(entropy_episodes, policy_entropies,
                      "Average Policy Entropy", "Episode", "Entropy",
                      os.path.join(outdir, "policy_entropy.png"))
     
-    # Value differences (tracked every 300 episodes)
+    # Value differences (tracked every log_interval episodes)
     if value_diffs_max:
-        diff_episodes = np.arange(0, len(value_diffs_max)) * 300
+        diff_episodes = np.arange(0, len(value_diffs_max)) * log_interval
         plot_and_save(diff_episodes, value_diffs_max,
                      "Max Value Difference Between Steps", "Episode", "Max |ΔV|",
                      os.path.join(outdir, "value_diff_max.png"))
@@ -274,9 +274,9 @@ def plot_training_progress(pursuer_rewards: list, evader_rewards: list,
                      "Mean Value Difference Between Steps", "Episode", "Mean |ΔV|",
                      os.path.join(outdir, "value_diff_mean.png"))
     
-    # Policy L1 differences (tracked every 300 episodes)
+    # Policy L1 differences (tracked every log_interval episodes)
     if policy_l1_diffs:
-        diff_episodes = np.arange(0, len(policy_l1_diffs)) * 300
+        diff_episodes = np.arange(0, len(policy_l1_diffs)) * log_interval
         plot_and_save(diff_episodes, policy_l1_diffs,
                      "Mean L1 Norm of Policy Differences", "Episode", "Mean L1(π)",
                      os.path.join(outdir, "policy_l1_diff.png"))
