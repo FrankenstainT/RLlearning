@@ -1,19 +1,31 @@
 """
-Competitive Pursuer-Evader Environment
-======================================
+Competitive Pursuer-Evader Environment with Obstacles and Goal
+==============================================================
 
-A 4x4 grid environment for competitive pursuer-evader game.
+A 5x5 grid environment for competitive pursuer-evader game with obstacles and evader goal.
 """
 
 import numpy as np
 from typing import Tuple, List, Optional
 
 
-class CompetitiveEnv:
-    """Competitive environment with pursuer and evader."""
+class CompetitiveEnv5x5:
+    """Competitive environment with pursuer, evader, obstacles, and evader goal."""
     
-    def __init__(self, size=4):
+    def __init__(self, size=5, obstacles=None, evader_goal=None):
         self.size = size
+        
+        # Default obstacles: (1,1), (2,2), (3,3)
+        if obstacles is None:
+            self.obstacles = [(1, 1), (2, 2), (3, 3)]
+        else:
+            self.obstacles = obstacles
+        
+        # Default evader goal: (0, 4)
+        if evader_goal is None:
+            self.evader_goal = (0, 4)
+        else:
+            self.evader_goal = evader_goal
         
         # Actions: 0=Up, 1=Down, 2=Left, 3=Right
         self.actions = {
@@ -26,15 +38,19 @@ class CompetitiveEnv:
         self.action_size = 4
         self.joint_action_size = 16  # 4 × 4
         
-        # Get all valid positions
-        self.valid_positions = [(y, x) for y in range(size) for x in range(size)]
+        # Get all valid positions (excluding obstacles)
+        self.valid_positions = []
+        for y in range(size):
+            for x in range(size):
+                if (y, x) not in self.obstacles:
+                    self.valid_positions.append((y, x))
         
     def _is_valid_position(self, y: int, x: int) -> bool:
-        """Check if position is within bounds."""
-        return 0 <= y < self.size and 0 <= x < self.size
+        """Check if position is within bounds and not an obstacle."""
+        return 0 <= y < self.size and 0 <= x < self.size and (y, x) not in self.obstacles
     
     def _apply_action(self, pos: Tuple[int, int], action: int) -> Tuple[int, int]:
-        """Apply action to position, staying in place if invalid."""
+        """Apply action to position, staying in place if invalid or hits obstacle."""
         y, x = pos
         dy, dx = self.actions[action]
         new_y, new_x = y + dy, x + dx
@@ -42,7 +58,7 @@ class CompetitiveEnv:
         if self._is_valid_position(new_y, new_x):
             return (new_y, new_x)
         else:
-            return pos  # Stay in place if out of bounds
+            return pos  # Stay in place if out of bounds or hits obstacle
     
     def _manhattan_distance(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> int:
         """Compute Manhattan distance between two positions."""
@@ -52,14 +68,19 @@ class CompetitiveEnv:
               evader_pos: Optional[Tuple[int, int]] = None) -> Tuple[Tuple[int, int], Tuple[int, int]]:
         """
         Reset environment to random or specified positions.
-        Ensures pursuer and evader are in distinct cells.
+        Ensures pursuer and evader are in distinct valid cells (not obstacles, not goal).
         """
         if pursuer_pos is None or evader_pos is None:
-            # Sample random distinct positions
-            available = self.valid_positions.copy()
+            # Sample random distinct positions (excluding obstacles and goal)
+            available = [p for p in self.valid_positions if p != self.evader_goal]
+            if len(available) < 2:
+                raise ValueError("Not enough valid positions for both agents")
             pursuer_pos = tuple(available.pop(np.random.randint(len(available))))
             evader_pos = tuple(available[np.random.randint(len(available))])
         
+        # Validate positions
+        if pursuer_pos in self.obstacles or evader_pos in self.obstacles:
+            raise ValueError("Agents cannot start on obstacles")
         if pursuer_pos == evader_pos:
             raise ValueError("Pursuer and evader must start in distinct cells")
         
@@ -76,26 +97,34 @@ class CompetitiveEnv:
         new_pursuer_pos = self._apply_action(pursuer_pos, pursuer_action)
         new_evader_pos = self._apply_action(evader_pos, evader_action)
         
-        # Check if pursuer caught evader
-        # Caught if they end up in the same position OR if they switch positions (cross paths)
+        # Check if pursuer caught evader (same position or switched positions)
         caught = (new_pursuer_pos == new_evader_pos) or \
                 (new_pursuer_pos == evader_pos and new_evader_pos == pursuer_pos)
         
-        # Compute distance-based rewards
+        # Check if evader reached goal
+        evader_reached_goal = (new_evader_pos == self.evader_goal)
+        final_reward = 20
+                # Compute distance-based rewards
         old_distance = self._manhattan_distance(pursuer_pos, evader_pos)
         new_distance = self._manhattan_distance(new_pursuer_pos, new_evader_pos)
         
-        # Pursuer reward: positive for getting closer, +100 for catching
+        # Pursuer: reward for reducing distance
+        pursuer_reward = old_distance - new_distance  # Positive if distance decreased
+        # Evader: reward for increasing distance
+        evader_reward = new_distance - old_distance  # Positive if distance increased
+        # Compute rewards
         if caught:
-            pursuer_reward = 10.0
-            evader_reward = -10.0  # Evader gets penalized for being caught
+            # Pursuer caught evader
+            pursuer_reward += final_reward
+            evader_reward -= final_reward
+            done = True
+        elif evader_reached_goal:
+            # Evader reached goal (evader wins)
+            pursuer_reward -= final_reward  # Pursuer gets punished
+            evader_reward += final_reward    # Evader gets reward (same as catch reward)
+            done = True
         else:
-            # Pursuer: reward for reducing distance
-            pursuer_reward = old_distance - new_distance  # Positive if distance decreased
-            # Evader: reward for increasing distance
-            evader_reward = new_distance - old_distance  # Positive if distance increased
-        
-        done = caught
+            done = False
         
         return new_pursuer_pos, new_evader_pos, pursuer_reward, evader_reward, done
     
@@ -117,10 +146,11 @@ class CompetitiveEnv:
         return pursuer_action, evader_action
     
     def get_all_start_pairs(self) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
-        """Get all possible distinct start position pairs."""
+        """Get all possible distinct start position pairs (excluding obstacles and goal)."""
         pairs = []
-        for pursuer_pos in self.valid_positions:
-            for evader_pos in self.valid_positions:
+        available = [p for p in self.valid_positions if p != self.evader_goal]
+        for pursuer_pos in available:
+            for evader_pos in available:
                 if pursuer_pos != evader_pos:
                     pairs.append((pursuer_pos, evader_pos))
         return pairs

@@ -1,6 +1,6 @@
 """
-Run Nash DQN for Competitive Pursuer-Evader Game
-=================================================
+Run Pure Nash Q-Learning for Competitive Pursuer-Evader Game
+==============================================================
 """
 
 import numpy as np
@@ -9,15 +9,16 @@ import sys
 import os
 import time
 import argparse
+import json
+import datetime
+
 # Add parent directory to path to import shared modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from competitive_env import CompetitiveEnv
-from nash_dqn import NashDQN, IS_WINDOWS, get_has_multiprocessing, get_cuda_available
+from nash_competitive.competitive_env import CompetitiveEnv
+from nash_q_learning import NashQLearning
 from visualization import frames_to_gif
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-import csv
-import json
 
 
 def moving_average(data: np.ndarray, window: int = 100) -> np.ndarray:
@@ -46,12 +47,12 @@ def policy_entropy(p: np.ndarray) -> float:
     return float(-(p * np.log(p)).sum())
 
 
-def train_agent(env: CompetitiveEnv, agent: NashDQN, 
+def train_agent(env: CompetitiveEnv, agent: NashQLearning, 
                 num_episodes: int = 30000, max_steps: int = 50,
                 log_interval: int = 500,
                 track_policy_drift: bool = True,
                 print_interval: int | None = None):
-    """Train the Nash DQN agent."""
+    """Train the Nash Q-Learning agent."""
     pursuer_rewards = []
     evader_rewards = []
     episode_lengths = []
@@ -67,8 +68,7 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
     for pursuer_pos in env.valid_positions:
         for evader_pos in env.valid_positions:
             if pursuer_pos != evader_pos:
-                state = env.state_to_features(pursuer_pos, evader_pos)
-                all_states.append(state)
+                all_states.append((pursuer_pos, evader_pos))
     
     prev_snapshot = None
     if print_interval is None:
@@ -80,7 +80,6 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
     for episode in range(num_episodes):
         # Reset to random distinct positions
         pursuer_pos, evader_pos = env.reset()
-        state = env.state_to_features(pursuer_pos, evader_pos)
         
         agent.start_episode()
         pursuer_total_reward = 0
@@ -90,20 +89,17 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
         
         while not done and steps < max_steps:
             # Choose joint action
-            pursuer_action, evader_action = agent.choose_joint_action(state, training=True)
-            joint_action_idx = env.joint_action_to_index(pursuer_action, evader_action)
+            pursuer_action, evader_action = agent.choose_joint_action(
+                pursuer_pos, evader_pos, training=True)
             
             # Take step
             next_pursuer_pos, next_evader_pos, pursuer_reward, evader_reward, done = \
                 env.step(pursuer_pos, pursuer_action, evader_pos, evader_action)
             
-            next_state = env.state_to_features(next_pursuer_pos, next_evader_pos)
-            
-            # Store experience (use pursuer reward for Q-learning, but track both)
-            agent.update(state, joint_action_idx, pursuer_reward, next_state, done)
-            
-            # Train the network
-            agent.train_step()
+            # Update Q-values
+            agent.update(pursuer_pos, evader_pos, pursuer_action, evader_action,
+                        pursuer_reward, evader_reward,
+                        next_pursuer_pos, next_evader_pos, done)
             
             pursuer_total_reward += pursuer_reward
             evader_total_reward += evader_reward
@@ -111,21 +107,6 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
             
             pursuer_pos = next_pursuer_pos
             evader_pos = next_evader_pos
-            state = next_state
-        
-        # If episode ended due to max_steps, add final step with 0 reward
-        # if not done and steps >= max_steps:
-        #     pursuer_action, evader_action = agent.choose_joint_action(state, training=True)
-        #     joint_action_idx = env.joint_action_to_index(pursuer_action, evader_action)
-            
-        #     final_reward = 0.0
-        #     final_done = True
-            
-        #     agent.update(state, joint_action_idx, final_reward, state, final_done)
-        #     agent.train_step()
-            
-        #     pursuer_total_reward += final_reward
-        #     evader_total_reward += final_reward
         
         # End episode and get average TD error
         avg_td = agent.end_episode()
@@ -143,12 +124,13 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
         
         # Decay epsilon
         agent.decay_epsilon()
+        
         # Track policy entropy and drift (less frequently to save time)
         if track_policy_drift and log_interval and (episode+1) % log_interval == 0:
             # Compute average policy entropy
             entropies = []
-            for state in all_states:  # Reduced sample size for efficiency
-                policy = agent.get_policy_distribution(state)
+            for pursuer_pos_state, evader_pos_state in all_states:
+                policy = agent.get_policy_distribution(pursuer_pos_state, evader_pos_state)
                 entropies.append(policy_entropy(policy))
             policy_entropies.append(np.mean(entropies))
             
@@ -184,6 +166,7 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
                 policy_l1_diffs.append(0.0)
             
             prev_snapshot = current_snapshot
+        
         if (episode + 1) % print_interval == 0:
             pursuer_wins = sum(1 for w in episode_winners[-print_interval:] if w == "Pursuer")
             elapsed_time = time.time() - start_time
@@ -191,12 +174,17 @@ def train_agent(env: CompetitiveEnv, agent: NashDQN,
             minutes = int((elapsed_time % 3600) // 60)
             seconds = int(elapsed_time % 60)
             time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            
+            # Get current learning rate
+            current_lr = agent._get_learning_rate()
+            
             print(f"Episode {episode + 1}/{num_episodes} - "
                   f"Pursuer Avg Reward (last {print_interval}): {np.mean(pursuer_rewards[-print_interval:]):.2f}, "
                   f"Evader Avg Reward (last {print_interval}): {np.mean(evader_rewards[-print_interval:]):.2f}, "
                   f"Avg Steps: {np.mean(episode_lengths[-print_interval:]):.2f}, "
                   f"Pursuer Win Rate (last {print_interval}): {pursuer_wins/print_interval:.2%}, "
                   f"Epsilon: {agent.epsilon:.4f}, "
+                  f"LR: {current_lr:.6f}, "
                   f"Time: {time_str}")
     
     return (pursuer_rewards, evader_rewards, episode_lengths, td_errors_per_episode,
@@ -208,7 +196,7 @@ def plot_training_progress(pursuer_rewards: list, evader_rewards: list,
                           episode_lengths: list, td_errors: list,
                           episode_winners: list, policy_entropies: list,
                           value_diffs_max: list, value_diffs_mean: list,
-                          policy_l1_diffs: list, outdir: str = 'nash_results',
+                          policy_l1_diffs: list, outdir: str = 'nash_q_learning_results',
                           log_interval: int = 500):
     """Plot all training progress metrics."""
     os.makedirs(outdir, exist_ok=True)
@@ -254,7 +242,6 @@ def plot_training_progress(pursuer_rewards: list, evader_rewards: list,
                  os.path.join(outdir, "episode_lengths.png"))
     
     # Win rate
-    
     pursuer_wins = np.array([1 if w == "Pursuer" else 0 for w in episode_winners], float)
     if len(pursuer_wins) >= window:
         ma_wins = moving_average(pursuer_wins, window)
@@ -263,7 +250,7 @@ def plot_training_progress(pursuer_rewards: list, evader_rewards: list,
                      f"Pursuer Win Rate (MA={window})", "Episode", "Win Rate",
                      os.path.join(outdir, "win_rate.png"))
     
-    # Policy entropy (tracked every 500 episodes)
+    # Policy entropy (tracked every log_interval episodes)
     if policy_entropies:
         entropy_episodes = np.arange(0, len(policy_entropies)) * log_interval
         plot_and_save(entropy_episodes, policy_entropies,
@@ -288,8 +275,8 @@ def plot_training_progress(pursuer_rewards: list, evader_rewards: list,
                      os.path.join(outdir, "policy_l1_diff.png"))
 
 
-def visualize_policies(env: CompetitiveEnv, agent: NashDQN,
-                      outdir: str = 'nash_results'):
+def visualize_policies(env: CompetitiveEnv, agent: NashQLearning,
+                      outdir: str = 'nash_q_learning_results'):
     """Visualize learned policies for pursuer and evader."""
     os.makedirs(outdir, exist_ok=True)
     size = env.size
@@ -314,9 +301,8 @@ def visualize_policies(env: CompetitiveEnv, agent: NashDQN,
         for pursuer_x in range(size):
             pursuer_pos = (pursuer_y, pursuer_x)
             if pursuer_pos != fixed_evader:
-                state = env.state_to_features(pursuer_pos, fixed_evader)
-                pursuer_value_map[pursuer_y, pursuer_x] = agent.get_value(state)
-                pursuer_action, _ = agent.get_policy(state)
+                pursuer_value_map[pursuer_y, pursuer_x] = agent.get_value(pursuer_pos, fixed_evader)
+                pursuer_action, _ = agent.get_policy(pursuer_pos, fixed_evader)
                 pursuer_policy_map[pursuer_y, pursuer_x] = pursuer_action
             else:
                 pursuer_value_map[pursuer_y, pursuer_x] = np.nan
@@ -331,9 +317,8 @@ def visualize_policies(env: CompetitiveEnv, agent: NashDQN,
         for evader_x in range(size):
             evader_pos = (evader_y, evader_x)
             if evader_pos != fixed_pursuer:
-                state = env.state_to_features(fixed_pursuer, evader_pos)
-                evader_value_map[evader_y, evader_x] = agent.get_value(state)
-                _, evader_action = agent.get_policy(state)
+                evader_value_map[evader_y, evader_x] = agent.get_value(fixed_pursuer, evader_pos)
+                _, evader_action = agent.get_policy(fixed_pursuer, evader_pos)
                 evader_policy_map[evader_y, evader_x] = evader_action
             else:
                 evader_value_map[evader_y, evader_x] = np.nan
@@ -466,8 +451,8 @@ def draw_frame(env: CompetitiveEnv, pursuer_pos: Tuple[int, int],
     return fname
 
 
-def evaluate_all_starts(env: CompetitiveEnv, agent: NashDQN, 
-                        max_steps: int = 50, outdir: str = 'nash_results'):
+def evaluate_all_starts(env: CompetitiveEnv, agent: NashQLearning, 
+                        max_steps: int = 50, outdir: str = 'nash_q_learning_results'):
     """Evaluate from all possible start position pairs, record frames, and create GIFs."""
     traces = {}
     eval_dir = os.path.join(outdir, "evaluation_traces")
@@ -483,7 +468,6 @@ def evaluate_all_starts(env: CompetitiveEnv, agent: NashDQN,
     for idx, (start_pursuer_pos, start_evader_pos) in enumerate(start_pairs):
         pursuer_pos = start_pursuer_pos
         evader_pos = start_evader_pos
-        state = env.state_to_features(pursuer_pos, evader_pos)
         
         # Create directory for this start pair
         case_name = f"eval_P{start_pursuer_pos[0]}_{start_pursuer_pos[1]}_E{start_evader_pos[0]}_{start_evader_pos[1]}"
@@ -499,7 +483,8 @@ def evaluate_all_starts(env: CompetitiveEnv, agent: NashDQN,
         # Greedy evaluation (no exploration)
         while not done and steps < max_steps:
             # Choose best joint action (greedy) BEFORE drawing frame
-            pursuer_action, evader_action = agent.choose_joint_action(state, training=False)
+            pursuer_action, evader_action = agent.choose_joint_action(
+                pursuer_pos, evader_pos, training=False)
             
             # Draw frame with the actions that will be taken
             draw_frame(env, pursuer_pos, evader_pos, steps, frames_dir,
@@ -516,7 +501,6 @@ def evaluate_all_starts(env: CompetitiveEnv, agent: NashDQN,
             
             pursuer_pos = next_pursuer_pos
             evader_pos = next_evader_pos
-            state = env.state_to_features(pursuer_pos, evader_pos)
         
         # Draw final frame
         if done or steps >= max_steps:
@@ -578,11 +562,90 @@ def evaluate_all_starts(env: CompetitiveEnv, agent: NashDQN,
     print(f"  Reward distribution plot saved to: {os.path.join(outdir, 'reward_distribution.png')}")
 
 
+def plot_visit_frequencies(agent: NashQLearning, env: CompetitiveEnv, outdir: str):
+    """Plot visualization of state visit frequencies."""
+    os.makedirs(outdir, exist_ok=True)
+    
+    # Collect visit frequencies for all states
+    visit_data = []
+    for pursuer_pos in env.valid_positions:
+        for evader_pos in env.valid_positions:
+            if pursuer_pos != evader_pos:
+                # Create state key manually (same format as in NashQLearning)
+                pursuer_y, pursuer_x = pursuer_pos
+                evader_y, evader_x = evader_pos
+                state_key = (pursuer_y, pursuer_x, evader_y, evader_x)
+                visit_count = agent.visit_counts.get(state_key, 0)
+                visit_data.append(visit_count)
+    
+    visit_data = np.array(visit_data)
+    
+    # Create figure with multiple subplots
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # 1. Histogram of visit frequencies
+    axes[0, 0].hist(visit_data, bins=50, edgecolor='black', alpha=0.7)
+    axes[0, 0].set_xlabel('Visit Count')
+    axes[0, 0].set_ylabel('Number of States')
+    axes[0, 0].set_title('Distribution of State Visit Frequencies')
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # 2. Log-scale histogram (to see distribution better)
+    non_zero_visits = visit_data[visit_data > 0]
+    if len(non_zero_visits) > 0:
+        axes[0, 1].hist(non_zero_visits, bins=50, edgecolor='black', alpha=0.7)
+        axes[0, 1].set_xlabel('Visit Count (log scale)')
+        axes[0, 1].set_ylabel('Number of States')
+        axes[0, 1].set_title('Distribution of Visited States (Non-zero)')
+        axes[0, 1].set_xscale('log')
+        axes[0, 1].grid(True, alpha=0.3)
+    else:
+        axes[0, 1].text(0.5, 0.5, 'No visited states', 
+                       ha='center', va='center', transform=axes[0, 1].transAxes)
+        axes[0, 1].set_title('Distribution of Visited States (Non-zero)')
+    
+    # 3. Cumulative distribution
+    sorted_visits = np.sort(visit_data)[::-1]  # Sort descending
+    cumulative = np.cumsum(sorted_visits)
+    cumulative_pct = cumulative / cumulative[-1] * 100 if cumulative[-1] > 0 else cumulative
+    axes[1, 0].plot(range(len(sorted_visits)), cumulative_pct, linewidth=2)
+    axes[1, 0].set_xlabel('State Rank (by visit count)')
+    axes[1, 0].set_ylabel('Cumulative % of Total Visits')
+    axes[1, 0].set_title('Cumulative Visit Distribution')
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # 4. Statistics text
+    stats_text = f"""Visit Frequency Statistics:
+    
+Total States: {len(visit_data)}
+Visited States: {np.sum(visit_data > 0)}
+Unvisited States: {np.sum(visit_data == 0)}
+
+Total Visits: {np.sum(visit_data):,}
+Mean Visits: {np.mean(visit_data):.2f}
+Median Visits: {np.median(visit_data):.2f}
+Min Visits: {np.min(visit_data)}
+Max Visits: {np.max(visit_data):,}
+Std Dev: {np.std(visit_data):.2f}
+
+Coverage: {np.sum(visit_data > 0) / len(visit_data) * 100:.2f}%
+"""
+    axes[1, 1].text(0.1, 0.5, stats_text, fontsize=10, 
+                   verticalalignment='center', family='monospace')
+    axes[1, 1].axis('off')
+    axes[1, 1].set_title('Statistics Summary')
+    
+    plt.tight_layout()
+    visit_plot_path = os.path.join(outdir, 'visit_frequencies.png')
+    plt.savefig(visit_plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved visit frequency visualization to {visit_plot_path}")
+
+
 def save_parameters(params: Dict, outdir: str):
     """Save all parameters to a JSON file."""
     params_file = os.path.join(outdir, 'parameters.json')
     # Add timestamp
-    import datetime
     params['run_info'] = {
         'timestamp': datetime.datetime.now().isoformat(),
         'timestamp_readable': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -592,100 +655,18 @@ def save_parameters(params: Dict, outdir: str):
     print(f"Parameters saved to {params_file}")
 
 
-def print_parallelization_status(agent, env):
-    """Print parallelization and optimization features status."""
-    import torch
-    
-    print("\n" + "=" * 80)
-    print("Parallelization and Optimization Status")
-    print("=" * 80)
-    
-    # 1. Batch GPU computation for all Q-values
-    gpu_available = torch.cuda.is_available()
-    batch_gpu = gpu_available
-    print(f"1. Batch GPU computation for all Q-values: {'✓ ENABLED' if batch_gpu else '✗ DISABLED (CPU only)'}")
-    if batch_gpu:
-        print(f"   Device: {torch.cuda.get_device_name(0)}")
-    
-    # 2. Multiprocessing for batch linear programming
-    has_multiprocessing = get_has_multiprocessing()
-    cuda_available = get_cuda_available()
-    multiprocessing_enabled = (
-        agent.enable_multiprocessing and
-        has_multiprocessing and 
-        agent.num_workers > 1 and 
-        hasattr(env, 'valid_positions')
-    )
-    if multiprocessing_enabled:
-        all_states_count = len([(p, e) for p in env.valid_positions 
-                                for e in env.valid_positions if p != e])
-        multiprocessing_enabled = all_states_count > 10
-    
-    print(f"2. Multiprocessing for batch linear programming: {'✓ ENABLED' if multiprocessing_enabled else '✗ DISABLED'}")
-    if multiprocessing_enabled:
-        print(f"   Workers: {agent.num_workers}")
-        if cuda_available and not IS_WINDOWS:
-            print(f"   Start method: spawn (required for CUDA)")
-        elif IS_WINDOWS:
-            print(f"   Start method: spawn (Windows default)")
-        else:
-            print(f"   Start method: fork (Linux default)")
-    else:
-        reasons = []
-        if not agent.enable_multiprocessing:
-            reasons.append("manually disabled")
-        if not has_multiprocessing:
-            reasons.append("not supported")
-        if agent.num_workers <= 1:
-            reasons.append(f"num_workers={agent.num_workers}")
-        if cuda_available and IS_WINDOWS:
-            reasons.append("Windows with CUDA (spawn overhead)")
-        if not reasons:
-            reasons.append("small batch size (< 10 states)")
-        print(f"   Reason: {', '.join(reasons)}")
-    
-    # 3. Pre-solve all linear programming after update
-    cache_update = agent.update_cache_after_training
-    cache_freq = agent.cache_update_frequency
-    print(f"3. Pre-solve all linear programming after update: {'✓ ENABLED' if cache_update else '✗ DISABLED'}")
-    if cache_update:
-        if hasattr(agent, '_all_states_for_cache') and agent._all_states_for_cache:
-            num_states = len(agent._all_states_for_cache)
-            print(f"   States to cache: {num_states}")
-            print(f"   Cache update frequency: Every {cache_freq} training steps")
-            print(f"   NOTE: Updating every step is too expensive with exact LP!")
-        else:
-            print(f"   WARNING: All states not set for cache (call agent.set_all_states_for_cache())")
-    else:
-        print(f"   Nash equilibria will be solved on-demand during action selection")
-    
-    # 4. Fast Nash algorithm
-    fast_nash = agent.use_fast_nash
-    print(f"4. Fast Nash algorithm: {'✓ ENABLED' if fast_nash else '✗ DISABLED (using exact LP)'}")
-    if fast_nash:
-        print(f"   Using iterative best response (approximate, ~10-100x faster)")
-    else:
-        print(f"   Using exact linear programming solver")
-    
-    print("=" * 80 + "\n")
-
-
 def main():
     """Main training and evaluation loop."""
-    parser = argparse.ArgumentParser(description='Train or evaluate Nash DQN agent')
-    parser.add_argument('--load-model', type=str, default=None,
-                        help='Path to saved model file to load (skips training)')
-    parser.add_argument('--outdir', type=str, default='nash_results_slim',
+    parser = argparse.ArgumentParser(description='Train or evaluate Pure Nash Q-Learning agent')
+    parser.add_argument('--outdir', type=str, default='nash_q_learning_results',
                         help='Output directory for results')
     parser.add_argument('--skip-training', action='store_true',
-                        help='Skip training (only evaluate if model is loaded)')
+                        help='Skip training (only evaluate)')
     args = parser.parse_args()
     
     # Set random seed for reproducibility
     random_seed = 42
     np.random.seed(random_seed)
-    import torch
-    torch.manual_seed(random_seed)
     
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
@@ -694,17 +675,20 @@ def main():
     env_size = 4
     
     # Agent hyperparameters
-    input_size = 4  # [pursuer_x, pursuer_y, evader_x, evader_y]
+    state_size = 16  # 4x4 grid
     joint_action_size = 16  # 4 × 4 joint actions
-    hidden_size = 128
-    learning_rate = 5e-4
-    gamma = 0.95
+    learning_rate = 0.2  # Initial learning rate (will decrease)
+    gamma = 0.9
     epsilon_start = 0.3
     epsilon_end = 0.001
     epsilon_decay = 0.995
-    tau = 0.01
-    batch_size = 256  # Increased for better GPU utilization
-    buffer_size = 50000
+    
+    # Improved learning parameters
+    use_decreasing_lr = True  # Use decreasing learning rate for convergence
+    # Optimistic initialization: use small value to encourage exploration without biasing Nash equilibrium
+    # Too high (e.g., 1.0) causes constant Q-value matrices, leading to uniform Nash policies
+    # Value should be small relative to reward scale (catch reward = 10.0)
+    optimistic_init = 0.1  # Small optimistic value to encourage exploration
     
     # Training parameters
     num_episodes = 3000
@@ -713,63 +697,18 @@ def main():
     # Create environment
     env = CompetitiveEnv(size=env_size)
     
-    # Load or create agent
-    update_cache = False  # Set to True to pre-compute Nash for all states periodically
-    if args.load_model:
-        print(f"Loading model from {args.load_model}...")
-        agent = NashDQN.load(args.load_model)
-        print("Model loaded successfully!")
-    else:
-        # Create Nash DQN agent
-        # Optionally enable cache updates periodically for faster action selection
-        # Since train_step is already batched (256 samples), we can update cache more frequently
-        # cache_update_frequency=1 means every training step (which processes 256 samples)
-        cache_update_frequency = 1  # Update cache every N training steps (1 = every step, which is batched)
-        enable_multiprocessing = False  # Set True to allow worker pool usage for snapshots/cache
-        target_cache_refresh_interval = 25  # Clear target Nash cache every N soft updates
-        agent = NashDQN(
-            input_size=input_size,
-            joint_action_size=joint_action_size,
-            learning_rate=learning_rate,
-            gamma=gamma,
-            epsilon_start=epsilon_start,
-            epsilon_end=epsilon_end,
-            epsilon_decay=epsilon_decay,
-            tau=tau,
-            batch_size=batch_size,
-            buffer_size=buffer_size,
-            use_fast_nash=False, # Use fast approximate Nash solver
-            update_cache_after_training=update_cache,
-            cache_update_frequency=cache_update_frequency,
-            enable_multiprocessing=enable_multiprocessing,
-            target_cache_refresh_interval=target_cache_refresh_interval
-        )
-    
-    # Set all states for cache (if cache updates are enabled)
-    if update_cache and not args.load_model:
-        all_states_for_cache = []
-        for pursuer_pos in env.valid_positions:
-            for evader_pos in env.valid_positions:
-                if pursuer_pos != evader_pos:
-                    state = env.state_to_features(pursuer_pos, evader_pos)
-                    all_states_for_cache.append(state)
-        agent.set_all_states_for_cache(all_states_for_cache)
-        print(f"Cache update enabled: Will pre-compute Nash for {len(all_states_for_cache)} states every {cache_update_frequency} training steps")
-    
-    # Get device information
-    import torch
-    device_info = {
-        'device': str(agent.device),
-        'cuda_available': torch.cuda.is_available(),
-    }
-    if torch.cuda.is_available():
-        device_info['cuda_device'] = torch.cuda.get_device_name(0)
-        device_info['cuda_version'] = torch.version.cuda
-        device_info['gpu_count'] = torch.cuda.device_count()
-        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-    else:
-        print("WARNING: CUDA not available, using CPU (will be very slow)")
+    # Create Nash Q-Learning agent with improved settings
+    agent = NashQLearning(
+        state_size=state_size,
+        joint_action_size=joint_action_size,
+        learning_rate=learning_rate,
+        gamma=gamma,
+        epsilon_start=epsilon_start,
+        epsilon_end=epsilon_end,
+        epsilon_decay=epsilon_decay,
+        use_decreasing_lr=use_decreasing_lr,
+        optimistic_init=optimistic_init
+    )
     
     # Collect all parameters
     parameters = {
@@ -778,52 +717,34 @@ def main():
             'size': env_size,
         },
         'agent': {
-            'input_size': input_size,
+            'state_size': state_size,
             'joint_action_size': joint_action_size,
-            'hidden_size': hidden_size,
             'learning_rate': learning_rate,
+            'use_decreasing_lr': use_decreasing_lr,
+            'optimistic_init': optimistic_init,
             'gamma': gamma,
             'epsilon_start': epsilon_start,
             'epsilon_end': epsilon_end,
             'epsilon_decay': epsilon_decay,
-            'tau': tau,
-            'batch_size': batch_size,
-            'buffer_size': buffer_size,
-            'enable_multiprocessing': enable_multiprocessing,
-            'target_cache_refresh_interval': target_cache_refresh_interval,
         },
         'training': {
             'num_episodes': num_episodes,
             'max_steps': max_steps,
         },
-        'network_architecture': {
-            'type': 'NashDQNNetwork',
-            'layers': [
-                {'type': 'Linear', 'input': input_size, 'output': hidden_size},
-                {'type': 'ReLU'},
-                {'type': 'Linear', 'input': hidden_size, 'output': hidden_size},
-                {'type': 'ReLU'},
-                {'type': 'Linear', 'input': hidden_size, 'output': joint_action_size},
-            ]
-        },
-        'nash_equilibrium': {
-            'method': 'linear_programming',
-            'solver': 'scipy.optimize.linprog',
-        },
-        'device': device_info
+        'algorithm': {
+            'type': 'Pure Nash Q-Learning',
+            'nash_solver': 'Linear Programming (scipy.optimize.linprog)',
+        }
     }
     
     # Save parameters
     save_parameters(parameters, outdir)
     
-    # Print parallelization status
-    print_parallelization_status(agent, env)
-    log_interval = 256
+    log_interval = 100
     
-    # Train agent (skip if model is loaded and skip-training is set)
-    model_path = os.path.join(outdir, 'trained_model.pt')
-    if args.load_model and args.skip_training:
-        print("Skipping training (model loaded, --skip-training set)")
+    # Train agent (skip if skip-training is set)
+    if args.skip_training:
+        print("Skipping training (--skip-training set)")
         pursuer_rewards, evader_rewards, episode_lengths, td_errors = [], [], [], []
         episode_winners, policy_entropies, value_diffs_max, value_diffs_mean, policy_l1_diffs = [], [], [], [], []
     else:
@@ -835,13 +756,10 @@ def main():
             agent,
             num_episodes=num_episodes,
             max_steps=max_steps,
-            log_interval=log_interval,  # Disable expensive drift tracking
+            log_interval=log_interval,
             track_policy_drift=True,
             print_interval=50
         )
-        
-        # Save trained model
-        agent.save(model_path)
         
         # Plot training progress
         if pursuer_rewards:  # Only plot if we have training data
@@ -849,20 +767,93 @@ def main():
                                   episode_winners, policy_entropies, value_diffs_max, 
                                   value_diffs_mean, policy_l1_diffs, outdir=outdir,
                                   log_interval=log_interval)
+        
+        # Save final Q-table
+        q_table_path = os.path.join(outdir, 'final_q_table.json')
+        agent.save_q_table(q_table_path)
+        
+        # Save visit frequencies
+        visit_freq_path = os.path.join(outdir, 'visit_frequencies.json')
+        agent.save_visit_frequencies(visit_freq_path)
+        
+        # Save final policies and values
+        policies_values_path = os.path.join(outdir, 'final_policies_and_values.json')
+        agent.save_policies_and_values(env, policies_values_path)
+        
+        # Analyze state coverage
+        coverage_info = agent.analyze_state_coverage(env)
+        print(f"\nQ-table Coverage Analysis:")
+        print(f"  Total states: {coverage_info['total_states']}")
+        print(f"  Visited states: {coverage_info['visited_states']}")
+        print(f"  Unvisited states: {coverage_info['unvisited_states']}")
+        print(f"  Coverage: {coverage_info['coverage']:.2%}")
+        if coverage_info['unvisited_states'] > 0:
+            print(f"  Sample unvisited states: {coverage_info['unvisited_state_list']}")
+        
+        # Print visit statistics
+        visit_stats = coverage_info.get('visit_statistics', {})
+        if visit_stats:
+            print(f"\nVisit Frequency Statistics:")
+            print(f"  Total visits: {visit_stats.get('total_visits', 0):,}")
+            print(f"  Mean visits per state: {visit_stats.get('mean_visits', 0):.2f}")
+            print(f"  Median visits per state: {visit_stats.get('median_visits', 0):.2f}")
+            print(f"  Min visits: {visit_stats.get('min_visits', 0)}")
+            print(f"  Max visits: {visit_stats.get('max_visits', 0):,}")
+            print(f"  Std dev: {visit_stats.get('std_visits', 0):.2f}")
+        
+        # Print state-action coverage
+        sa_coverage = coverage_info.get('state_action_coverage', {})
+        if sa_coverage:
+            print(f"\nState-Action Coverage:")
+            print(f"  Total state-action pairs: {sa_coverage.get('total_state_actions', 0):,}")
+            print(f"  Visited state-action pairs: {sa_coverage.get('visited_state_actions', 0):,}")
+            print(f"  Coverage: {sa_coverage.get('coverage', 0):.2%}")
+            print(f"  Mean visits per state-action: {sa_coverage.get('mean_visits_per_sa', 0):.2f}")
+            print(f"  Median visits per state-action: {sa_coverage.get('median_visits_per_sa', 0):.2f}")
+            print(f"  Min visits: {sa_coverage.get('min_visits_per_sa', 0)}")
+            print(f"  Max visits: {sa_coverage.get('max_visits_per_sa', 0):,}")
+        
+        # Print learning rate info
+        if agent.use_decreasing_lr:
+            current_lr = agent._get_learning_rate()
+            print(f"\nLearning Rate:")
+            print(f"  Initial learning rate: {agent.learning_rate_initial:.6f}")
+            print(f"  Current learning rate: {current_lr:.6f}")
+            print(f"  Total updates: {agent.total_updates:,}")
+            print(f"  Learning rate decay: α_t = α₀ / (1 + t/10000)")
+        
+        # Save coverage info
+        coverage_path = os.path.join(outdir, 'state_coverage.json')
+        import json
+        coverage_serializable = {
+            'total_states': coverage_info['total_states'],
+            'visited_states': coverage_info['visited_states'],
+            'unvisited_states': coverage_info['unvisited_states'],
+            'coverage': coverage_info['coverage'],
+            'unvisited_state_list': [f"P{pos[0]}_{pos[1]}_E{pos[2]}_{pos[3]}" 
+                                    for pos in coverage_info['unvisited_state_list']],
+            'visit_statistics': visit_stats,
+            'state_action_coverage': sa_coverage,
+            'learning_rate_info': {
+                'use_decreasing_lr': agent.use_decreasing_lr,
+                'initial_lr': agent.learning_rate_initial,
+                'current_lr': agent._get_learning_rate() if agent.use_decreasing_lr else agent.learning_rate_initial,
+                'total_updates': agent.total_updates
+            } if hasattr(agent, 'use_decreasing_lr') else {}
+        }
+        with open(coverage_path, 'w') as f:
+            json.dump(coverage_serializable, f, indent=2)
+        print(f"  Saved coverage analysis to {coverage_path}")
+        
+        # Create visualization of visit frequencies
+        plot_visit_frequencies(agent, env, outdir)
     
-    # Visualize and evaluate using exact LP solver
-    with agent.exact_nash_mode():
-        visualize_policies(env, agent, outdir=outdir)
-        evaluate_all_starts(env, agent, max_steps=50, outdir=outdir)
-    
-    # Cleanup resources
-    agent.cleanup()
+    # Visualize and evaluate
+    visualize_policies(env, agent, outdir=outdir)
+    evaluate_all_starts(env, agent, max_steps=50, outdir=outdir)
     
     print("\nTraining and evaluation complete!")
     print(f"All results saved to the '{outdir}' directory.")
-    if not (args.load_model and args.skip_training):
-        print(f"Trained model saved to: {os.path.join(outdir, 'trained_model.pt')}")
-        print(f"To load this model next time, use: --load-model {os.path.join(outdir, 'trained_model.pt')}")
 
 
 if __name__ == "__main__":

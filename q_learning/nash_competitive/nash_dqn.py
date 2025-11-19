@@ -990,6 +990,78 @@ class NashDQN:
         finally:
             self.set_fast_nash_mode(previous)
     
+    def save(self, filepath: str):
+        """Save the trained network and agent state to a file."""
+        import os
+        os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
+        
+        save_dict = {
+            'q_network_state_dict': self.q_network._module.state_dict(),
+            'target_network_state_dict': self.target_network._module.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'epsilon': self.epsilon,
+            'use_fast_nash': self.use_fast_nash,
+            'input_size': self.q_network._module.fc1.in_features,
+            'joint_action_size': self.q_network._module.fc3.out_features,
+            'gamma': self.gamma,
+            'tau': self.tau,
+        }
+        torch.save(save_dict, filepath)
+        print(f"Saved trained network to {filepath}")
+    
+    @classmethod
+    def load(cls, filepath: str, device: str = None, **kwargs):
+        """Load a trained network from a file.
+        
+        Args:
+            filepath: Path to the saved model file
+            device: Device to load on ('cuda', 'cpu', or None for auto-detect)
+            **kwargs: Additional arguments to pass to NashDQN.__init__ (will override saved values)
+        
+        Returns:
+            Loaded NashDQN agent
+        """
+        checkpoint = torch.load(filepath, map_location=device)
+        
+        # Get device
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            device = torch.device(device)
+        
+        # Create agent with saved or provided parameters
+        agent = cls(
+            input_size=checkpoint.get('input_size', kwargs.get('input_size', 4)),
+            joint_action_size=checkpoint.get('joint_action_size', kwargs.get('joint_action_size', 16)),
+            learning_rate=kwargs.get('learning_rate', 5e-4),
+            gamma=checkpoint.get('gamma', kwargs.get('gamma', 0.95)),
+            epsilon_start=kwargs.get('epsilon_start', 0.5),
+            epsilon_end=kwargs.get('epsilon_end', 0.01),
+            epsilon_decay=kwargs.get('epsilon_decay', 0.995),
+            tau=checkpoint.get('tau', kwargs.get('tau', 0.01)),
+            batch_size=kwargs.get('batch_size', 64),
+            buffer_size=kwargs.get('buffer_size', 50000),
+            use_fast_nash=checkpoint.get('use_fast_nash', kwargs.get('use_fast_nash', True)),
+            update_cache_after_training=kwargs.get('update_cache_after_training', False),
+            cache_update_frequency=kwargs.get('cache_update_frequency', 1),
+            enable_multiprocessing=kwargs.get('enable_multiprocessing', False),
+            num_workers=kwargs.get('num_workers', None),
+            target_cache_refresh_interval=kwargs.get('target_cache_refresh_interval', 1),
+        )
+        
+        # Load network states
+        agent.q_network._module.load_state_dict(checkpoint['q_network_state_dict'])
+        agent.target_network._module.load_state_dict(checkpoint['target_network_state_dict'])
+        agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        agent.epsilon = checkpoint.get('epsilon', agent.epsilon)
+        
+        print(f"Loaded trained network from {filepath}")
+        print(f"  Epsilon: {agent.epsilon:.4f}")
+        print(f"  Fast Nash: {agent.use_fast_nash}")
+        print(f"  Device: {agent.device}")
+        
+        return agent
+    
     def cleanup(self):
         """Clean up resources (close worker pool)."""
         self._close_worker_pool()
